@@ -14,6 +14,9 @@ Requirements:
 """
 
 import os
+import re
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -24,13 +27,13 @@ from typing import Optional, Tuple
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import GLib, Gtk  # noqa: E402  # type: ignore
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402  # type: ignore
 
 APP_ID = "com.example.updatifyyy"
 APP_TITLE = "Updatify"
 REPO_PATH = os.path.expanduser("~/dots-hyprland")
 AUTO_REFRESH_SECONDS = 60
-KEEPALIVE_SECONDS = 120  # sudo credential keep-alive interval (seconds)
 
 
 @dataclass
@@ -225,17 +228,15 @@ class MainWindow(Gtk.ApplicationWindow):
         outer.pack_end(self.infobar, False, False, 0)
 
         self.show_all()
+        self.connect("key-press-event", self._on_key_press)
+        # Removed LogConsole usage; no key-press shortcut for install now.
 
         # Initial state
         self._status: Optional[RepoStatus] = None
         self._update_logs: list[
             tuple[str, str, str]
         ] = []  # (timestamp, event, details)
-        self._sudo_password: Optional[str] = (
-            None  # cached sudo password (kept in-memory only)
-        )
-        self._sudo_keepalive_thread: Optional[threading.Thread] = None
-        self._sudo_keepalive_stop = threading.Event()
+
         self._busy(False, "")
 
         # First refresh and periodic checks
@@ -351,127 +352,91 @@ class MainWindow(Gtk.ApplicationWindow):
         if not (self._status and self._status.has_updates):
             return
         repo_path = self._status.repo_path
+        self._busy(True, "Updating...")
 
         def work():
-            # Explicit stash if dirty before pull (even though --autostash also helps)
-            pre_stash_ref = None
+            stashed = False
             if self._status and self._status.dirty > 0:
-                ts = time.strftime("%Y%m%d-%H%M%S")
-                rc, out, err = run_git(
+                subprocess.run(
                     [
+                        "git",
                         "stash",
                         "push",
                         "--include-untracked",
                         "-m",
-                        f"updatifyyy-auto-{ts}",
+                        "updatifyyy-auto",
                     ],
-                    repo_path,
-                )
-                if rc == 0:
-                    # Extract created stash ref (last line often looks like "Saved working directory ...")
-                    # We can assume it's the newest stash: stash@{0}
-                    pre_stash_ref = "stash@{0}"
-                else:
-                    # Non-fatal; continue without explicit stash
-                    pass
-            cmd = ["git", "pull", "--rebase", "--autostash", "--stat"]
-            try:
-                cp = subprocess.run(
-                    cmd,
                     cwd=repo_path,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     text=True,
-                    timeout=300,
                 )
-                ok = cp.returncode == 0
-                # (removed unused msg_type assignment)
-                title = "Update complete" if ok else "Update failed"
-                body = (cp.stdout or "").strip()
-                if cp.stderr:
-                    body = (body + "\n\n" + cp.stderr.strip()).strip()
-            except Exception as exc:
-                ok = False
-
-                title = "Update error"
-                body = str(exc)
-
-            # Attempt to restore stash after successful pull
-            stash_info = ""
-            if ok and pre_stash_ref:
-                rc_pop, out_pop, err_pop = run_git(
-                    ["stash", "pop", pre_stash_ref], repo_path
+                stashed = True
+            pull = subprocess.run(
+                ["git", "pull", "--rebase", "--autostash", "--stat"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+            )
+            success = pull.returncode == 0
+            if success and stashed:
+                subprocess.run(
+                    ["git", "stash", "pop"],
+                    cwd=repo_path,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
                 )
-                if rc_pop != 0:
-                    stash_info = f"Failed to pop stash ({pre_stash_ref}). You may need to resolve conflicts manually.\n{err_pop.strip()}"
-                else:
-                    stash_info = "Local changes restored from stash."
-            elif pre_stash_ref and not ok:
-                stash_info = (
-                    f"Update failed; your stashed changes are kept as {pre_stash_ref}."
-                )
-            # After pull, attempt to run ./setup install (non-sudo script may invoke sudo internally)
-            setup_summary = ""
-            if ok:
-                setup_path = os.path.join(repo_path, "setup")
-                if os.path.isfile(setup_path) and os.access(setup_path, os.X_OK):
-                    # Ensure sudo credential cached if script will need it
-                    if not self._ensure_sudo_cached():
-                        setup_summary = "Skipped './setup install' (sudo auth failed)."
-                    else:
-                        try:
-                            sp = subprocess.run(
-                                ["./setup", "install"],
-                                cwd=repo_path,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                timeout=600,
-                            )
-                            setup_summary = (
-                                "Setup script finished successfully."
-                                if sp.returncode == 0
-                                else f"Setup script exited with {sp.returncode}."
-                            )
-                            body += (
-                                "\n\n== ./setup install stdout ==\n"
-                                + (sp.stdout or "").strip()
-                            )
-                            if sp.stderr:
-                                body += (
-                                    "\n\n== ./setup install stderr ==\n"
-                                    + sp.stderr.strip()
-                                )
-                        except Exception as exc:
-                            setup_summary = f"Error running setup script: {exc}"
-                else:
-                    setup_summary = "No executable './setup' script found; skipped."
+            # Launch installer in external terminal (if present)
+            setup_path = os.path.join(repo_path, "setup")
+            if (
+                success
+                and os.path.isfile(setup_path)
+                and os.access(setup_path, os.X_OK)
+            ):
+                launch_install_external(repo_path)
+            GLib.idle_add(
+                lambda: self._finish_update(success, pull.stdout, pull.stderr)
+            )
 
-            def done():
-                self._busy(False, "")
-                # Show a nicer dialog with summary and details instead of raw command output only
-                if ok:
-                    cnt_rc, cnt_out, _ = run_git(
-                        ["rev-list", "--count", "HEAD@{1}..HEAD"], repo_path
-                    )
-                    pulled_count = cnt_out.strip() if cnt_rc == 0 else "unknown"
-                    summary = f"Pulled {pulled_count} new commit(s)."
-                else:
-                    summary = "The update encountered an error."
-                # Append stash/setup info if present
-                extra_notes = "\n".join(
-                    [s for s in [stash_info, setup_summary] if s]
-                ).strip()
-                if extra_notes:
-                    body_with_notes = (body + "\n\n== Notes ==\n" + extra_notes).strip()
-                else:
-                    body_with_notes = body
-                self._add_log(title, summary, body_with_notes or "")
-                show_details_dialog(self, title, summary, body_with_notes or "")
-                # Always refresh after attempting update
-                self.refresh_status()
+        threading.Thread(target=work, daemon=True).start()
 
-            GLib.idle_add(done)
+    def _finish_update(self, success: bool, stdout: str, stderr: str) -> None:
+        self._busy(False, "")
+        title = "Update complete" if success else "Update failed"
+        details = stdout + ("\n" + stderr if stderr else "")
+        self._add_log(title, title, details)
+        self.refresh_status()
+
+    # Removed key press handler (console/shortcut no longer used)
+
+    def run_install_external(self) -> None:
+        setup_path = os.path.join(REPO_PATH, "setup")
+        if not (os.path.isfile(setup_path) and os.access(setup_path, os.X_OK)):
+            self._show_message(Gtk.MessageType.INFO, "No executable './setup' found.")
+            return
+        launch_install_external(REPO_PATH)
+
+    # Removed auto-respond logic (no embedded console interaction).
+
+    def _on_key_press(self, _widget, event) -> bool:
+        if event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in (
+            Gdk.KEY_i,
+            Gdk.KEY_I,
+        ):
+            self.run_install_external()
+            return True
+        return False
+
+    def _auto_inject(self, text: str) -> bool:
+        # No auto injections; console removed.
+        return False
+        # Guard against automated inputs while a sudo password prompt is active
+        block_until = getattr(self, "_auto_inject_block_until", 0.0)
+        if time.time() < block_until:
+            return False
+        self.console.send_text(text)
+        return False
 
     def _add_log(self, event: str, summary: str, details: str) -> None:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -497,119 +462,80 @@ class MainWindow(Gtk.ApplicationWindow):
         )
         show_details_dialog(self, "Update Logs", brief_body, expanded)
 
-        self._busy(True, "Updating...")
-        threading.Thread(target=work, daemon=True).start()
-
-    def _ensure_sudo_cached(self) -> bool:
-        """
-        Ensure we have a cached sudo credential. Prompts user if necessary.
-        Returns True if we have or obtained a valid credential.
-        """
-        # First try non-interactive validation
-        non_interactive = subprocess.run(
-            ["sudo", "-n", "-v"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if non_interactive.returncode == 0:
-            # Already cached
-            if self._sudo_password is None:
-                self._sudo_password = ""  # represent existing cached auth
-            if not self._sudo_keepalive_thread:
-                self._start_sudo_keepalive()
-            return True
-        # Need password
-        if self._sudo_password is None or not self._sudo_password:
-            pwd = self._prompt_sudo_password()
-            if pwd is None:
-                return False
-            self._sudo_password = pwd
-        # Validate with password
-        validate = subprocess.run(
-            ["sudo", "-S", "-v"],
-            input=(self._sudo_password + "\n"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if validate.returncode != 0:
-            # Wrong password; clear and prompt again once
-            self._sudo_password = None
-            pwd = self._prompt_sudo_password(error="Incorrect password, try again:")
-            if pwd is None:
-                return False
-            self._sudo_password = pwd
-            validate = subprocess.run(
-                ["sudo", "-S", "-v"],
-                input=(self._sudo_password + "\n"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            if validate.returncode != 0:
-                self._sudo_password = None
-                return False
-        if not self._sudo_keepalive_thread:
-            self._start_sudo_keepalive()
-        return True
-
-    def _start_sudo_keepalive(self) -> None:
-        if self._sudo_keepalive_thread:
-            return
-
-        def loop():
-            while not self._sudo_keepalive_stop.is_set():
-                if self._sudo_password is not None:
-                    subprocess.run(
-                        ["sudo", "-S", "-v"],
-                        input=(self._sudo_password + "\n"),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                    )
-                # Sleep shorter than timestamp timeout (~5 min default)
-                self._sudo_keepalive_stop.wait(KEEPALIVE_SECONDS)
-
-        t = threading.Thread(target=loop, daemon=True)
-        self._sudo_keepalive_thread = t
-        t.start()
-
-    def _prompt_sudo_password(self, error: Optional[str] = None) -> Optional[str]:
-        dialog = Gtk.Dialog(
-            title="Sudo Authentication",
-            transient_for=self,
-            flags=0,
-        )
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("OK", Gtk.ResponseType.OK)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_border_width(12)
-        content = dialog.get_content_area()
-        content.add(box)
-        label_text = (
-            error if error else "Enter your sudo password to proceed with setup:"
-        )
-        lbl = Gtk.Label(label=label_text)
-        lbl.set_xalign(0.0)
-        box.pack_start(lbl, False, False, 0)
-        entry = Gtk.Entry()
-        entry.set_visibility(False)
-        entry.set_invisible_char("•")
-        entry.set_activates_default(True)
-        box.pack_start(entry, False, False, 0)
-        dialog.set_default_response(Gtk.ResponseType.OK)
-        dialog.show_all()
-        resp = dialog.run()
-        value = entry.get_text() if resp == Gtk.ResponseType.OK else None
-        dialog.destroy()
-        return value
-
     def _show_message(self, msg_type: Gtk.MessageType, message: str) -> None:
         # Show a footer infobar
         self.infobar.set_message_type(msg_type)
         self.info_label.set_text(message)
         self.infobar.show_all()
+
+    # Removed LogConsole class (console UI eliminated in favor of external terminal)
+    # (Removed LogConsole class; external terminal used for installer)
+
+    def _insert_ansi(
+        self, buf: Gtk.TextBuffer, iter_end: Gtk.TextIter, text: str
+    ) -> None:
+        """
+        Very lightweight ANSI color parser: supports SGR codes for foreground colors
+        and reset. Unknown codes are ignored; nested sequences adjust current tag.
+        """
+        # Pattern for ANSI escape sequences
+        import re
+
+        pattern = re.compile(r"(\x1b\[[0-9;]*m)")
+        # Split keeping delimiters
+        parts = pattern.split(text)
+        current_tag = None
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("\x1b[") and part.endswith("m"):
+                codes = part[2:-1].split(";")
+                if "0" in codes:
+                    current_tag = None
+                    continue
+                # Foreground color codes 30-37, 90-97
+                fg_code = next(
+                    (
+                        c
+                        for c in codes
+                        if c.isdigit() and (30 <= int(c) <= 37 or 90 <= int(c) <= 97)
+                    ),
+                    None,
+                )
+                if fg_code:
+                    color = self._ansi_code_to_color(int(fg_code))
+                    tagname = f"fg_{fg_code}"
+                    if not buf.get_tag_table().lookup(tagname):
+                        buf.create_tag(tagname, foreground=color)
+                    current_tag = tagname
+                continue
+            # Regular text
+            if current_tag:
+                buf.insert_with_tags_by_name(iter_end, part, current_tag)
+            else:
+                buf.insert(iter_end, part)
+            iter_end = buf.get_end_iter()
+
+    def _ansi_code_to_color(self, code: int) -> str:
+        base = {
+            30: "#000000",
+            31: "#cc0000",
+            32: "#4e9a06",
+            33: "#c4a000",
+            34: "#3465a4",
+            35: "#75507b",
+            36: "#06989a",
+            37: "#d3d7cf",
+            90: "#555753",
+            91: "#ef2929",
+            92: "#8ae234",
+            93: "#fce94f",
+            94: "#729fcf",
+            95: "#ad7fa8",
+            96: "#34e2e2",
+            97: "#eeeeec",
+        }
+        return base.get(code, "#ffffff")
 
 
 def show_details_dialog(
@@ -683,6 +609,52 @@ def on_view_changes_clicked(window: Gtk.Window) -> None:
     threading.Thread(target=work, daemon=True).start()
 
 
+def launch_install_external(repo_path: str) -> None:
+    # Try common terminal emulators
+    terminals = [
+        ("kitty", ["kitty", "-e"]),
+        ("alacritty", ["alacritty", "-e"]),
+        ("gnome-terminal", ["gnome-terminal", "--"]),
+        ("xterm", ["xterm", "-e"]),
+        ("konsole", ["konsole", "-e"]),
+        ("foot", ["foot", "sh", "-c"]),
+    ]
+    # Ensure setup script uses polkitexec wrappers (polkit via pkexec)
+    try:
+        setup_path = os.path.join(repo_path, "setup")
+        if os.path.isfile(setup_path) and os.access(setup_path, os.R_OK):
+            with open(setup_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if "UPDATIFYYY_POLKIT_PATCHED" not in content:
+                header = '# UPDATIFYYY_POLKIT_PATCHED\npolkitexec() { command -v pkexec >/dev/null 2>&1 && pkexec "$@" || "$@"; }\n'
+                content = header + content
+            # Replace 'sudo ' with 'polkitexec '
+            content = re.sub(r"(?m)(?<![\\w-])sudo\\s+", "polkitexec ", content)
+            # Replace 'yay ' with 'polkitexec yay '
+            content = re.sub(r"(?m)(?<![\\w-])yay\\s+", "polkitexec yay ", content)
+            with open(setup_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            # Ensure executable bit
+            os.chmod(setup_path, os.stat(setup_path).st_mode | 0o111)
+    except Exception:
+        pass
+    cmd = ["./setup", "install"]
+    for name, base in terminals:
+        if shutil.which(name):
+            full = base + [
+                "sh",
+                "-c",
+                f"cd {shlex.quote(repo_path)} && {shlex.quote(cmd[0])} {cmd[1]}",
+            ]
+            try:
+                subprocess.Popen(full)
+                return
+            except Exception:
+                continue
+    # Fallback: run detached without terminal
+    subprocess.Popen(cmd, cwd=repo_path)
+
+
 class App(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
@@ -691,6 +663,19 @@ class App(Gtk.Application):
         if not self.props.active_window:
             MainWindow(self)
         self.props.active_window.present()
+
+    def do_shutdown(self) -> None:  # type: ignore[override]
+        # Stop sudo keepalive thread cleanly
+        win = self.props.active_window
+        if win and hasattr(win, "_sudo_keepalive_stop"):
+            try:
+                win._sudo_keepalive_stop.set()
+                t = getattr(win, "_sudo_keepalive_thread", None)
+                if t and t.is_alive():
+                    t.join(timeout=1.0)
+            except Exception:
+                pass
+        super().do_shutdown()
 
 
 def main(argv: Optional[list[str]] = None) -> int:
