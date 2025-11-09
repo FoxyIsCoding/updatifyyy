@@ -224,9 +224,15 @@ class MainWindow(Gtk.ApplicationWindow):
         mi_settings = Gtk.MenuItem(label="Settings")
         mi_settings.connect("activate", self.on_settings_clicked)
         menu.append(mi_settings)
+
         mi_logs = Gtk.MenuItem(label="Logs")
         mi_logs.connect("activate", self.on_logs_clicked)
         menu.append(mi_logs)
+
+        mi_fonts = Gtk.MenuItem(label="Install Nerd Fonts")
+        mi_fonts.connect("activate", self.on_install_nerd_fonts_clicked)
+        menu.append(mi_fonts)
+
         menu.show_all()
 
         menu_btn = Gtk.MenuButton()
@@ -239,6 +245,7 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_end(self.update_btn)
         hb.pack_end(self.view_btn)
         hb.pack_end(menu_btn)
+        # Add Nerd Fonts install accessible also via menu item
 
         # Main content
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -461,10 +468,13 @@ class MainWindow(Gtk.ApplicationWindow):
     # Embedded log console helpers
     def _send_to_proc(self, text: str) -> None:
         p = getattr(self, "_current_proc", None)
-        if p and getattr(p, "stdin", None):
+        master_fd = getattr(p, "_pty_master_fd", None) if p else None
+        if p and (master_fd is not None or getattr(p, "stdin", None)):
             try:
-                p.stdin.write(text)
-                p.stdin.flush()
+                if master_fd is not None:
+                    os.write(master_fd, text.encode("utf-8", "replace"))
+                else:
+                    os.write(p.stdin.fileno(), text.encode("utf-8", "replace"))
                 self._append_log(f"[sent] {text}")
             except Exception as ex:
                 self._append_log(f"[send error] {ex}\n")
@@ -501,43 +511,48 @@ class MainWindow(Gtk.ApplicationWindow):
             return True
         return False
 
-    def _run_update_without_pull(self) -> None:
+    def _run_installer_common(self, test_mode: bool = False) -> None:
         """
-        Test mode: run installer (./setup install) WITHOUT performing a git pull.
-        Triggered via Ctrl+I. Useful for verifying installer behavior.
+        Unified path to run ./setup install with logging, PTY, auto input, and sudo/polkit pre-auth.
+        test_mode: when True, skips git pull logic and marks log header differently.
         """
         repo_path = self._status.repo_path if self._status else REPO_PATH
         setup_path = os.path.join(repo_path, "setup")
         self.log_revealer.set_reveal_child(True)
-        self._append_log("\n=== TEST UPDATE (no git pull) ===\n")
-        self._busy(True, "Running test update...")
+        self._append_log(
+            "\n=== INSTALLER START ({}) ===\n".format("TEST" if test_mode else "NORMAL")
+        )
+        self._busy(
+            True, "Running installer..." if test_mode else "Updating & installing..."
+        )
 
         def work():
             success = False
             if os.path.isfile(setup_path) and os.access(setup_path, os.X_OK):
-                self._append_log("Launching installer (test mode)...\n")
-                # Pre-auth for sudo / pkexec so installer won't prompt repeatedly
+                self._append_log("Pre-authenticating privileges...\n")
                 self._ensure_sudo_pre_auth()
                 self._patch_setup_for_polkit(repo_path)
+                self._append_log("Launching installer...\n")
                 try:
                     p = _spawn_setup_install(
                         repo_path,
-                        lambda msg: self._append_log(msg),
+                        lambda msg: self._append_log(str(msg)),
                         extra_args=["install"],
                         auto_input_seq=["\n", "\n", "\n", "n\n", "\n"],
+                        use_pty=True,
                     )
                     self._current_proc = p
                     if p and p.stdout:
                         for line in iter(p.stdout.readline, ""):
                             if not line:
                                 break
-                            self._append_log(line)
+                            self._append_log(str(line))
                         rc = p.wait()
                         self._append_log(f"[exit {rc}]\n")
                         success = rc == 0
-                        self._current_proc = None
                     else:
-                        success = False
+                        self._append_log("[error] setup script failed to start\n")
+                    self._current_proc = None
                 except Exception as ex:
                     self._append_log(f"[error] {ex}\n")
             else:
@@ -545,17 +560,139 @@ class MainWindow(Gtk.ApplicationWindow):
 
             def done():
                 self._busy(False, "")
+                title = "Installer (test mode)" if test_mode else "Installer"
                 status_msg = (
-                    "Test update completed"
+                    f"{title} completed successfully"
                     if success
-                    else "Test update finished with errors"
+                    else f"{title} finished with errors"
                 )
-                self._add_log("Test Update", status_msg, "")
-                # Do NOT call _post_update_prompt in test mode.
+                self._add_log(title, status_msg, "")
+                if success and not test_mode:
+                    self._post_update_prompt()
 
             GLib.idle_add(done)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _show_nerd_fonts_dialog(self) -> None:
+        """
+        Simple dialog to choose Nerd Fonts to install.
+        Installation runs via background thread; updates appear in log panel.
+        """
+        fonts = [
+            ("JetBrainsMono", "JetBrainsMono"),
+            ("FiraCode", "FiraCode"),
+            ("Hack", "Hack"),
+            ("CascadiaCode", "CascadiaCode"),
+            ("Iosevka", "Iosevka"),
+            ("Mononoki", "Mononoki"),
+            ("Meslo", "MesloLGS NF"),
+            ("Symbols Nerd", "SymbolsNerdFont"),
+            ("Noto Emoji", "NotoColorEmoji"),
+        ]
+        dialog = Gtk.Dialog(
+            title="Install Nerd Fonts",
+            transient_for=self,
+            flags=0,
+        )
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Install", Gtk.ResponseType.OK)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(12)
+        dialog.get_content_area().add(box)
+        info = Gtk.Label(
+            label="Select fonts to install (downloads to ~/.local/share/fonts/NerdFonts).\nRequires network and write permissions."
+        )
+        info.set_xalign(0.0)
+        box.pack_start(info, False, False, 0)
+        checks: list[tuple[Gtk.CheckButton, str]] = []
+        for label, key in fonts:
+            cb = Gtk.CheckButton.new_with_label(label)
+            cb.set_active(label in ("JetBrainsMono", "Symbols Nerd"))
+            box.pack_start(cb, False, False, 0)
+            checks.append((cb, key))
+        dialog.show_all()
+        resp = dialog.run()
+        if resp != Gtk.ResponseType.OK:
+            dialog.destroy()
+            return
+        selected = [k for cb, k in checks if cb.get_active()]
+        dialog.destroy()
+        if not selected:
+            self._show_message(Gtk.MessageType.INFO, "No fonts selected.")
+            return
+        self.log_revealer.set_reveal_child(True)
+        self._append_log("\n=== NERD FONTS INSTALL ===\n")
+        self._busy(True, "Installing fonts...")
+
+        def install_fonts():
+            success = True
+            target_dir = os.path.expanduser("~/.local/share/fonts/NerdFonts")
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as ex:
+                self._append_log(f"[error] mkdir fonts: {ex}\n")
+                success = False
+            base_url = (
+                "https://github.com/ryanoasis/nerd-fonts/releases/latest/download"
+            )
+            for font in selected:
+                archive = f"{font}.tar.xz"
+                url = f"{base_url}/{archive}"
+                self._append_log(f"Downloading {archive}...\n")
+                try:
+                    import urllib.request
+
+                    data = urllib.request.urlopen(url, timeout=30).read()
+                    tmp = os.path.join(target_dir, archive)
+                    with open(tmp, "wb") as f:
+                        f.write(data)
+                    import tarfile
+
+                    self._append_log(f"Extracting {archive}...\n")
+                    with tarfile.open(tmp, "r:xz") as tf:
+                        tf.extractall(path=target_dir)
+                    os.remove(tmp)
+                except Exception as ex:
+                    self._append_log(f"[error] {font}: {ex}\n")
+                    success = False
+            if success:
+                self._append_log("Updating font cache...\n")
+                try:
+                    subprocess.run(
+                        ["fc-cache", "-f", "-v"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+
+            def done():
+                self._busy(False, "")
+                self._add_log(
+                    "Nerd Fonts Install",
+                    "Fonts installation complete"
+                    if success
+                    else "Fonts installation had errors",
+                    ", ".join(selected),
+                )
+                self._show_message(
+                    Gtk.MessageType.INFO,
+                    "Nerd Fonts installed. Restart applications to use them."
+                    if success
+                    else "Some fonts failed to install. Check log.",
+                )
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=install_fonts, daemon=True).start()
+
+    def on_install_nerd_fonts_clicked(self, _item):
+        self._show_nerd_fonts_dialog()
+
+    def _run_update_without_pull(self) -> None:
+        # Backward compatibility: delegate to unified installer in test mode
+        self._run_installer_common(test_mode=True)
 
     def _on_key_press(self, _widget, event) -> bool:
         # Ctrl+I triggers test update (no git pull)
@@ -825,7 +962,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 for line in iter(p.stdout.readline, ""):
                     if not line:
                         break
-                    self._append_log(line)
+                    self._append_log(str(line))
                 rc = p.wait()
                 self._append_log(f"[exit {rc}]\n")
                 return rc
@@ -880,40 +1017,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 and os.path.isfile(setup_path)
                 and os.access(setup_path, os.X_OK)
             ):
-                self._append_log("Launching installer...\n")
-                # Pre-auth for sudo / pkexec so installer won't prompt repeatedly
-                self._ensure_sudo_pre_auth()
-                self._patch_setup_for_polkit(repo_path)
-                # Reuse the streaming helper to show live logs in the embedded panel
-                try:
-                    p = _spawn_setup_install(
-                        repo_path,
-                        lambda msg: self._append_log(msg),
-                        extra_args=["install"],
-                    )
-                    self._current_proc = p
-                    if p and p.stdout:
-                        for line in iter(p.stdout.readline, ""):
-                            if not line:
-                                break
-                            self._append_log(line)
-                        rc = p.wait()
-                        self._append_log(f"[exit {rc}]\n")
-                        self._current_proc = None
-                    # Guard against None return from _spawn_setup_install
-                    if p and p.stdout:
-                        for line in iter(p.stdout.readline, ""):
-                            if not line:
-                                break
-                            self._append_log(line)
-                        rc = p.wait()
-                        self._append_log(f"[exit {rc}]\n")
-                        success = rc == 0
-                    else:
-                        self._append_log("[error] setup script failed to start\n")
-                        success = False
-                except Exception as ex:
-                    self._append_log(f"[error] {ex}\n")
+                # Delegate to unified installer (normal mode) and return
+                self._run_installer_common(test_mode=False)
+                # Installer delegated; legacy inline logic removed
+                return
 
             GLib.idle_add(
                 lambda: self._finish_update(success, pull.stdout, pull.stderr)
@@ -1072,11 +1179,10 @@ class SetupConsole(Gtk.Window):
     def _apply_css(self):
         css = """
         .setup-console {
-            font-family: "JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Hack Nerd Font",
-                          "Cascadia Code PL", "MesloLGS NF", "Noto Sans Symbols2",
-                          "Noto Emoji", "DejaVu Sans Mono", monospace;
+            font-family: "JetBrainsMono NF", "JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono", "Iosevka Nerd Font", "Iosevka Term Nerd Font", "FantasqueSansMono Nerd Font", "Mononoki Nerd Font", "CaskaydiaCove Nerd Font", "SauceCodePro Nerd Font", "FiraCode Nerd Font", "FiraCode Nerd Font Mono", "Hack Nerd Font", "Cascadia Code PL", "MesloLGS NF", "Noto Sans Mono", "Noto Sans", "Noto Sans CJK SC", "Noto Sans Mono CJK SC", "Noto Sans Symbols2", "Noto Sans Symbols", "Noto Color Emoji", "Noto Emoji", "Symbols Nerd Font", "Nerd Font", "Symbola", "DejaVu Sans Mono", "DejaVu Sans", monospace;
             font-size: 12px;
             line-height: 1.25;
+            font-feature-settings: "liga" 1, "clig" 1, "calt" 1, "zero" 1, "ss01" 1;
         }
         """
         try:
@@ -1389,10 +1495,11 @@ class SetupConsole(Gtk.Window):
 def _init_log_css(self):
     css = """
     .log-view {
-        font-family: "JetBrainsMono NF", "JetBrainsMono Nerd Font", "JetBrainsMonoNL-Regular", "JetBrainsMonoNF-Regular", "FiraCode Nerd Font", "FiraCode Nerd Font Mono", "Hack Nerd Font", "Cascadia Code PL", "MesloLGS NF", "Noto Sans Symbols2", "Noto Emoji", "Noto Sans Mono", "Symbols Nerd Font", "Nerd Font", "DejaVu Sans Mono", monospace;
+        font-family: "JetBrainsMono NF", "JetBrainsMono Nerd Font", "JetBrainsMonoNL-Regular", "JetBrainsMonoNF-Regular", "JetBrainsMono Nerd Font Mono", "Iosevka Nerd Font", "Iosevka Term Nerd Font", "FantasqueSansMono Nerd Font", "Mononoki Nerd Font", "CaskaydiaCove Nerd Font", "Cascadia Code PL", "SauceCodePro Nerd Font", "FiraCode Nerd Font", "FiraCode Nerd Font Mono", "Hack Nerd Font", "MesloLGS NF", "Noto Sans Mono", "Noto Sans", "Noto Sans CJK SC", "Noto Sans Mono CJK SC", "Noto Sans Symbols2", "Noto Sans Symbols", "Noto Color Emoji", "Noto Emoji", "Symbols Nerd Font", "Nerd Font", "Symbola", "DejaVu Sans Mono", "DejaVu Sans", monospace;
         font-size: 12px;
         line-height: 1.25;
         white-space: pre-wrap;
+        font-feature-settings: "liga" 1, "clig" 1, "calt" 1, "zero" 1, "ss01" 1;
     }
     .ansi-bold     { font-weight: bold; }
     .ansi-dim      { opacity: 0.7; }
@@ -1424,6 +1531,13 @@ def _init_log_css(self):
             )
         if hasattr(self, "log_view"):
             self.log_view.get_style_context().add_class("log-view")
+            try:
+                ctx = self.log_view.get_pango_context()
+                if ctx:
+                    lang = Pango.Language.from_string("en")
+                    ctx.set_language(lang)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -1490,18 +1604,23 @@ def _spawn_setup_install(
     extra_args: list[str] | None = None,
     capture_stdout: bool = True,
     auto_input_seq: list[str] | None = None,
+    use_pty: bool = True,
 ):
     """
-    Try to execute the setup installer with fallbacks:
-    1. Direct exec: ./setup (requires executable bit and valid shebang if script)
-    2. bash ./setup ...
-    3. sh ./setup ...
-    Returns a Popen object or None.
-    logger: callable accepting a string to append to log/output.
-    extra_args: additional arguments after 'setup'.
-    capture_stdout: if True, pipes stdout/stderr; else inherits parent streams.
-    auto_input_seq: list of strings to send to stdin automatically (e.g. ["\\n","n\\n"])
+    Spawn ./setup with ANSI color + interactive support.
+
+    If use_pty is True we allocate a pseudo-terminal so tools think they are in a real
+    terminal (preserves colors, interactive prompts). Falls back to direct execution
+    methods if PTY allocation fails.
+
+    Returns a Popen object or None. When PTY is used we monkey-patch p.stdout with a
+    text wrapper so existing readline loops continue to work.
     """
+    import errno
+    import io
+    import os
+    import pty
+
     extra_args = extra_args or []
     base_cmds = [
         ["./setup"] + extra_args,
@@ -1509,77 +1628,126 @@ def _spawn_setup_install(
         ["sh", "./setup"] + extra_args,
     ]
 
+    def _env():
+        env = dict(os.environ)
+        env.update(
+            {
+                "FORCE_COLOR": "1",
+                "CLICOLOR": "1",
+                "CLICOLOR_FORCE": "1",
+                "TERM": "xterm-256color",
+            }
+        )
+        env.pop("NO_COLOR", None)
+        return env
+
     for cmd in base_cmds:
         try:
-            if capture_stdout:
-                env = dict(os.environ)
-                env.update(
-                    {
-                        "FORCE_COLOR": "1",
-                        "CLICOLOR": "1",
-                        "CLICOLOR_FORCE": "1",
-                        "TERM": "xterm-256color",
-                    }
-                )
-                env.pop("NO_COLOR", None)
+            master_fd, slave_fd = None, None
+            if use_pty:
+                try:
+                    master_fd, slave_fd = pty.openpty()
+                except Exception as ex:
+                    logger(f"[pty-warn] failed to open pty: {ex}; fallback no-pty\n")
+                    master_fd = slave_fd = None
+                    use_pty = False
+
+            if use_pty and master_fd is not None and slave_fd is not None:
                 p = subprocess.Popen(
                     cmd,
                     cwd=repo_path,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    env=_env(),
+                    close_fds=True,
+                )
+                # Close slave end in parent; child keeps it
+                try:
+                    os.close(slave_fd)
+                except Exception:
+                    pass
+                # Wrap master in text IO for readline compatibility (read-only)
+                master_file = os.fdopen(master_fd, "rb", buffering=0)
+                text_stream = io.TextIOWrapper(
+                    master_file, encoding="utf-8", errors="replace", newline="\n"
+                )
+
+                class PTYStdout:
+                    def __init__(self, stream):
+                        self._stream = stream
+                        self._buffer = ""
+
+                    def readline(self):
+                        # Accumulate until newline or EOF
+                        while True:
+                            chunk = self._stream.read(1)
+                            if not chunk:
+                                if self._buffer:
+                                    out = self._buffer
+                                    self._buffer = ""
+                                    return out
+                                return ""
+                            self._buffer += chunk
+                            if "\n" in self._buffer:
+                                line, rest = self._buffer.split("\n", 1)
+                                self._buffer = rest
+                                return line + "\n"
+
+                p.stdout = PTYStdout(text_stream)  # type: ignore[attr-defined]
+                p._pty_master_fd = master_fd  # type: ignore[attr-defined]
+                logger(f"[spawn/pty] {' '.join(cmd)}\n")
+            else:
+                # Non-PTY fallback
+                p = subprocess.Popen(
+                    cmd,
+                    cwd=repo_path,
+                    stdout=subprocess.PIPE if capture_stdout else None,
+                    stderr=subprocess.STDOUT if capture_stdout else None,
                     stdin=subprocess.PIPE,
                     universal_newlines=True,
                     bufsize=1,
-                    env=env,
+                    env=_env(),
                 )
-            else:
-                env = dict(os.environ)
-                env.update(
-                    {
-                        "FORCE_COLOR": "1",
-                        "CLICOLOR": "1",
-                        "CLICOLOR_FORCE": "1",
-                        "TERM": "xterm-256color",
-                    }
-                )
-                env.pop("NO_COLOR", None)
-                p = subprocess.Popen(
-                    cmd,
-                    cwd=repo_path,
-                    stdin=subprocess.PIPE,
-                    universal_newlines=True,
-                    env=env,
-                )
-            logger(f"[spawn] {' '.join(cmd)}\n")
-            # Auto input sequence
-            if p.stdin and auto_input_seq:
+                logger(f"[spawn] {' '.join(cmd)}\n")
+
+            # Auto input sequence (sent after slight delay to allow prompt rendering)
+            if auto_input_seq:
 
                 def _feed():
                     import time as _t
 
-                    stdin = p.stdin
-                    if not stdin:
+                    master_fd = getattr(p, "_pty_master_fd", None)
+                    pipe = p.stdin if master_fd is None else None
+                    if master_fd is None and not pipe:
                         logger(
                             "[auto-input] stdin unavailable; aborting auto sequence\n"
                         )
                         return
+                    _t.sleep(0.2)
                     for item in auto_input_seq:
                         try:
-                            if stdin.closed:
-                                logger("[auto-input] stdin closed; stopping\n")
-                                break
-                            stdin.write(item)
-                            stdin.flush()
+                            if master_fd is not None:
+                                os.write(master_fd, item.encode("utf-8", "replace"))
+                            else:
+                                if pipe is None:
+                                    logger("[auto-input] stdin unavailable; stopping\n")
+                                    break
+                                if getattr(pipe, "closed", False):
+                                    logger("[auto-input] stdin closed; stopping\n")
+                                    break
+                                os.write(pipe.fileno(), item.encode("utf-8", "replace"))
                             logger(f"[auto-input] {repr(item)}\n")
                         except Exception as _ex:
                             logger(f"[auto-input-error] {_ex}\n")
                             break
-                        _t.sleep(0.3)
+                        _t.sleep(0.25)
 
                 threading.Thread(target=_feed, daemon=True).start()
+
             return p
         except OSError as ex:
-            if ex.errno == 8:  # Exec format error
+            if ex.errno == errno.ENOEXEC:  # Exec format
                 logger(
                     f"[warn] Exec format error with {' '.join(cmd)}; trying fallback...\n"
                 )
@@ -1936,7 +2104,17 @@ def on_view_changes_clicked(window: Gtk.Window) -> None:
         return
 
     dialog = Gtk.Dialog(title="Pending Commits", transient_for=window, flags=0)
-    dialog.set_default_size(800, min(600, 120 + 32 * len(commits)))
+    dialog.set_modal(True)
+    dialog.set_resizable(True)
+    # Dynamic sizing based on content: approximate width from longest subject length
+    max_subject = max((len(c["subject"]) for c in commits), default=0)
+    # Rough char->px scaling factor; clamp for sanity
+    base_width = 560 + min(max_subject, 140) * 3
+    width = max(640, min(base_width, 1100))
+    # Height scales with number of commits; clamp
+    height = max(360, min(120 + 40 * len(commits), 800))
+    dialog.set_default_size(width, height)
+    dialog.maximize()
     dialog.add_button("Close", Gtk.ResponseType.CLOSE)
 
     area = dialog.get_content_area()
@@ -1954,6 +2132,8 @@ def on_view_changes_clicked(window: Gtk.Window) -> None:
     outer.pack_start(sw, True, True, 0)
 
     list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+    list_box.set_hexpand(True)
+    list_box.set_vexpand(True)
     sw.add(list_box)
 
     for c in commits:
@@ -1964,7 +2144,8 @@ def on_view_changes_clicked(window: Gtk.Window) -> None:
         meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         subject_lbl = Gtk.Label()
         subject_lbl.set_xalign(0.0)
-        subject_lbl.set_ellipsize(Gtk.EllipsizeMode.END)
+        subject_lbl.set_line_wrap(True)
+        subject_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
         subject_lbl.set_markup(
             f"<span foreground='#00ace6'>{GLib.markup_escape_text(c['short'])}</span> {GLib.markup_escape_text(c['subject'])}"
         )
