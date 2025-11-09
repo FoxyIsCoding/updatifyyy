@@ -38,10 +38,10 @@ from gi.repository import (
     Pango,  # noqa: E402  # type: ignore
 )
 
-APP_ID = "com.example.updatifyyy"
+APP_ID = "com.example.illogical-updots"
 APP_TITLE = "illogical-updots"
 # Settings (persisted)
-SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "updatifyyy")
+SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "illogical-updots")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 
 
@@ -787,8 +787,8 @@ class MainWindow(Gtk.ApplicationWindow):
             import subprocess
 
             user = os.getlogin()
-            rule_path = "/etc/polkit-1/rules.d/90-updatifyyy-keepauth.rules"
-            rule_content = f"""// Updatifyyy persistent auth rule
+            rule_path = "/etc/polkit-1/rules.d/90-illogical-updots-keepauth.rules"
+            rule_content = f"""// illogical-updots persistent auth rule
 polkit.addRule(function(action, subject) {{
     if (subject.user == "{user}" || subject.isInGroup("wheel") || subject.isInGroup("sudo")) {{
         return {{ result: polkit.Result.AUTH_ADMIN_KEEP }};
@@ -800,7 +800,7 @@ polkit.addRule(function(action, subject) {{
             try:
                 with open(rule_path, "r", encoding="utf-8") as f:
                     existing = f.read()
-                if "Updatifyyy persistent auth rule" in existing and user in existing:
+                if "illogical-updots persistent auth rule" in existing and user in existing:
                     need_write = False
             except Exception:
                 need_write = True
@@ -1460,10 +1460,11 @@ polkit.addRule(function(action, subject) {{
                     [
                         "git",
                         "stash",
+
                         "push",
                         "--include-untracked",
                         "-m",
-                        "updatifyyy-auto",
+                        "illogical-updots-auto",
                     ],
                     cwd=repo_path,
                     stdout=subprocess.DEVNULL,
@@ -1920,7 +1921,7 @@ class SetupConsole(Gtk.Window):
                 )
                 notification.set_body(body)
                 try:
-                    app.send_notification("updatifyyy-installer", notification)
+                    app.send_notification("illogical-updots-installer", notification)
                 except Exception:
                     pass
         except Exception:
