@@ -275,6 +275,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.primary_label.set_markup(
             "<span size='xx-large' weight='bold'>Checking repository status…</span>"
         )
+        # Make banner clickable to show detailed repo info
+        self.primary_label.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.primary_label.connect("button-press-event", self._on_banner_clicked)
         banner_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         banner_box.set_hexpand(True)
         banner_box.set_vexpand(True)
@@ -886,7 +889,7 @@ polkit.addRule(function(action, subject) {{
                 f"<span size='large'>{st.behind} new commit(s) to pull</span>"
             )
         else:
-            ctx.add_class("status-ok")
+            # ctx.add_class("status-ok")  # removed to avoid green styling
             self.primary_label.set_markup(
                 "<span size='xx-large' weight='bold'>Up to date</span>"
             )
@@ -936,6 +939,47 @@ polkit.addRule(function(action, subject) {{
                 "View commits to be pulled" if can_view else "No updates available"
             )
         self._busy(False, "")
+
+    def _on_banner_clicked(self, _widget, _event) -> bool:
+        # Show detailed repo info dialog
+        self._show_repo_info_dialog()
+        return True
+
+    def _show_repo_info_dialog(self) -> None:
+        st = self._status
+        if not st:
+            show_details_dialog(self, "Repository Info", "Status not loaded yet.", "")
+            return
+        repo_path = st.repo_path
+        # Gather extra git info
+        status_rc, status_out, status_err = run_git(["status", "--short"], repo_path)
+        remote_rc, remote_out, remote_err = run_git(["remote", "-v"], repo_path)
+        branch = st.branch or "(unknown)"
+        upstream = st.upstream or "(no upstream)"
+        summary_lines = [
+            f"Repo: {repo_path}",
+            f"Branch: {branch}",
+            f"Upstream: {upstream}",
+            f"Ahead: {st.ahead}",
+            f"Behind: {st.behind}",
+            f"Dirty files: {st.dirty}",
+        ]
+        if st.fetch_error:
+            summary_lines.append(f"Fetch warning: {st.fetch_error}")
+        if st.error:
+            summary_lines.append(f"Error: {st.error}")
+        summary = "\n".join(summary_lines)
+        details_parts = []
+        details_parts.append("== git status --short ==")
+        details_parts.append(status_out.strip() or "(clean)")
+        if status_err.strip():
+            details_parts.append("stderr:\n" + status_err.strip())
+        details_parts.append("\n== git remote -v ==")
+        details_parts.append(remote_out.strip() or "(none)")
+        if remote_err.strip():
+            details_parts.append("stderr:\n" + remote_err.strip())
+        details = "\n".join(details_parts)
+        show_details_dialog(self, "Repository Info", summary, details)
 
     def on_refresh_clicked(self, _btn: Gtk.Button) -> None:
         self.refresh_status()
@@ -1833,7 +1877,7 @@ def _init_log_css(self):
         margin-bottom: 10px;
     }
     .status-banner.status-up { color: #1e90ff; }
-    .status-banner.status-ok { color: #5cb85c; }
+    /* status-ok styling removed to avoid green color */
     .status-banner.status-err { color: #ff4d4f; }
     .ansi-bold     { font-weight: bold; }
     .ansi-dim      { opacity: 0.7; }
