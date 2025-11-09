@@ -14,7 +14,8 @@ Requirements:
 """
 
 import os
-import re
+
+# removed unused import re
 import shlex
 import shutil
 import subprocess
@@ -48,6 +49,7 @@ def _load_settings() -> dict:
     data = {
         "repo_path": os.path.expanduser("~/dots-hyprland"),
         "auto_refresh_seconds": 60,
+        "detached_console": False,  # new setting: run installer in separate window
     }
     try:
         if os.path.isfile(SETTINGS_FILE):
@@ -55,6 +57,7 @@ def _load_settings() -> dict:
 
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
+            # Only allow known keys
             data.update({k: v for k, v in loaded.items() if k in data})
     except Exception:
         pass
@@ -217,7 +220,7 @@ class MainWindow(Gtk.ApplicationWindow):
         # View changes button (commits to pull)
         self.view_btn = Gtk.Button(label="View changes")
         self.view_btn.set_tooltip_text("View commits to be pulled")
-        self.view_btn.connect("clicked", lambda _btn: on_view_changes_clicked(self))
+        self.view_btn.connect("clicked", lambda _btn: on_view_changes_quick(self))
         # Reordered pack_end so right side shows: Update, View changes, Menu (dots)
         # Menu button (dropdown) with Settings and Logs
         menu = Gtk.Menu()
@@ -395,75 +398,16 @@ class MainWindow(Gtk.ApplicationWindow):
 
     # Sudo / pkexec pre-auth and keepalive
     def _start_sudo_keepalive(self) -> None:
-        if self._sudo_keepalive_thread and self._sudo_keepalive_thread.is_alive():
-            return
-        import subprocess
-        import threading
-
-        self._sudo_keepalive_stop = threading.Event()
-
-        def loop():
-            # Refresh every 4 minutes until stop requested
-            stop_evt = self._sudo_keepalive_stop
-            if not stop_evt:
-                return
-            while not stop_evt.wait(240):
-                try:
-                    subprocess.run(
-                        ["sudo", "-n", "-v"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    # Ignore errors (no cached auth)
-                    pass
-
-        self._sudo_keepalive_thread = threading.Thread(target=loop, daemon=True)
-        self._sudo_keepalive_thread.start()
+        # Disabled: no background sudo keepalive
+        return
 
     def _ensure_sudo_pre_auth(self) -> None:
-        """
-        Attempt a one-time privilege elevation (pkexec preferred, fallback to sudo -v),
-        then start a keepalive thread so repeated sudo commands do not reprompt.
-        """
-        import shutil
-        import subprocess
-
-        try:
-            if shutil.which("pkexec"):
-                # pkexec GUI prompt once
-                subprocess.run(["pkexec", "/bin/true"])
-            else:
-                subprocess.run(["sudo", "-v"])
-            self._start_sudo_keepalive()
-        except Exception:
-            pass
+        # Disabled: no automatic sudo or polkit pre-auth
+        return
 
     def _patch_setup_for_polkit(self, repo_path: str) -> None:
-        """
-        Inline-patch the repository's ./setup script to wrap privileged commands
-        with polkitexec (uses pkexec if available, otherwise runs command directly),
-        replacing plain 'sudo ' and 'yay ' occurrences.
-        """
-        try:
-            setup_path = os.path.join(repo_path, "setup")
-            if not (os.path.isfile(setup_path) and os.access(setup_path, os.R_OK)):
-                return
-            with open(setup_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            header = '# UPDATIFYYY_POLKIT_PATCHED\npolkitexec() { command -v pkexec >/dev/null 2>&1 && pkexec "$@" || "$@"; }\n'
-            if "UPDATIFYYY_POLKIT_PATCHED" not in content:
-                content = header + content
-            # Replace 'sudo ' with 'polkitexec '
-            content = re.sub(r"(?m)(?<![\w-])sudo\s+", "polkitexec ", content)
-            # Replace 'yay ' with 'polkitexec yay '
-            content = re.sub(r"(?m)(?<![\w-])yay\s+", "polkitexec yay ", content)
-            with open(setup_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            os.chmod(setup_path, os.stat(setup_path).st_mode | 0o111)
-        except Exception:
-            # Best-effort patching; ignore failures
-            pass
+        # Disabled: do not modify setup script for polkit/sudo
+        return
 
     # Embedded log console helpers
     def _send_to_proc(self, text: str) -> None:
@@ -511,13 +455,47 @@ class MainWindow(Gtk.ApplicationWindow):
             return True
         return False
 
-    def _run_installer_common(self, test_mode: bool = False) -> None:
+    def _run_installer_common(
+        self, test_mode: bool = False, commands: Optional[list[list[str]]] = None
+    ) -> None:
         """
-        Unified path to run ./setup install with logging, PTY, auto input, and sudo/polkit pre-auth.
-        test_mode: when True, skips git pull logic and marks log header differently.
+        Run installer commands either embedded (default) or in a detached SetupConsole
+        window depending on SETTINGS['detached_console'].
         """
         repo_path = self._status.repo_path if self._status else REPO_PATH
         setup_path = os.path.join(repo_path, "setup")
+        detached = bool(SETTINGS.get("detached_console", False))
+
+        # Decide command list
+        cmds = commands or [["./setup", "install"]]
+
+        # Ensure sudo credential cache
+        # Removed automatic sudo/polkit pre-auth
+
+        if detached:
+            # Detached console path
+            if not (os.path.isfile(setup_path) and os.access(setup_path, os.X_OK)):
+                self._show_message(
+                    Gtk.MessageType.INFO, "No executable './setup' found."
+                )
+                return
+            import shlex
+
+            chained = " && ".join(shlex.join(c) for c in cmds)
+            title = "Installer (test)" if test_mode else "Installer"
+            console = SetupConsole(self, title=title)
+            console.present()
+            console.run_process(
+                ["bash", "-lc", chained],
+                cwd=repo_path,
+                on_finished=lambda: (
+                    self.refresh_status(),
+                    (not test_mode and self._post_update_prompt()),
+                ),
+            )
+            return
+
+        # Embedded path (colored PTY streaming)
         self.log_revealer.set_reveal_child(True)
         self._append_log(
             "\n=== INSTALLER START ({}) ===\n".format("TEST" if test_mode else "NORMAL")
@@ -529,32 +507,72 @@ class MainWindow(Gtk.ApplicationWindow):
         def work():
             success = False
             if os.path.isfile(setup_path) and os.access(setup_path, os.X_OK):
-                self._append_log("Pre-authenticating privileges...\n")
-                self._ensure_sudo_pre_auth()
-                self._patch_setup_for_polkit(repo_path)
-                self._append_log("Launching installer...\n")
-                try:
-                    p = _spawn_setup_install(
-                        repo_path,
-                        lambda msg: self._append_log(str(msg)),
-                        extra_args=["install"],
-                        auto_input_seq=["\n", "\n", "\n", "n\n", "\n"],
-                        use_pty=True,
-                    )
-                    self._current_proc = p
-                    if p and p.stdout:
-                        for line in iter(p.stdout.readline, ""):
-                            if not line:
+                for cmd in cmds:
+                    try:
+                        self._append_log(f"$ {' '.join(cmd)}\n")
+                        p = _spawn_setup_install(
+                            repo_path,
+                            lambda m: self._append_log(str(m)),
+                            extra_args=cmd[1:],
+                            capture_stdout=True,
+                            auto_input_seq=[],
+                            use_pty=True,
+                        )
+                        self._current_proc = p
+                        if p and p.stdout:
+                            for line in iter(p.stdout.readline, ""):
+                                if not line:
+                                    break
+                                self._append_log(str(line))
+                            rc = p.wait()
+                            self._append_log(f"[exit {rc}]\n")
+                            self._current_proc = None
+                            if rc != 0:
+                                success = False
                                 break
-                            self._append_log(str(line))
-                        rc = p.wait()
-                        self._append_log(f"[exit {rc}]\n")
-                        success = rc == 0
-                    else:
-                        self._append_log("[error] setup script failed to start\n")
-                    self._current_proc = None
-                except Exception as ex:
-                    self._append_log(f"[error] {ex}\n")
+                            success = True
+                        else:
+                            fallback_cmd = ["bash"] + cmd
+                            self._append_log(f"[fallback] {' '.join(fallback_cmd)}\n")
+                            env = dict(os.environ)
+                            env.update(
+                                {
+                                    "TERM": "xterm-256color",
+                                    "FORCE_COLOR": "1",
+                                    "CLICOLOR": "1",
+                                    "CLICOLOR_FORCE": "1",
+                                }
+                            )
+                            env.pop("NO_COLOR", None)
+                            p2 = subprocess.Popen(
+                                fallback_cmd,
+                                cwd=repo_path,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                stdin=subprocess.PIPE,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                bufsize=1,
+                                env=env,
+                            )
+                            self._current_proc = p2
+                            assert p2.stdout is not None
+                            for line in iter(p2.stdout.readline, ""):
+                                if not line:
+                                    break
+                                self._append_log(str(line))
+                            rc2 = p2.wait()
+                            self._append_log(f"[exit {rc2}]\n")
+                            self._current_proc = None
+                            if rc2 != 0:
+                                success = False
+                                break
+                            success = True
+                    except Exception as ex:
+                        self._append_log(f"[error] {ex}\n")
+                        success = False
+                        break
             else:
                 self._append_log("No executable './setup' found. Nothing to run.\n")
 
@@ -687,12 +705,69 @@ class MainWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=install_fonts, daemon=True).start()
 
+    def _ensure_polkit_keep_auth(self) -> None:
+        """
+        Install a polkit rules file to allow cached admin authentication (AUTH_ADMIN_KEEP)
+        for the current user (and wheel/sudo groups) so pkexec does not prompt repeatedly.
+        Best-effort; silently ignores failures.
+        """
+        try:
+            import shlex
+            import subprocess
+
+            user = os.getlogin()
+            rule_path = "/etc/polkit-1/rules.d/90-updatifyyy-keepauth.rules"
+            rule_content = f"""// Updatifyyy persistent auth rule
+polkit.addRule(function(action, subject) {{
+    if (subject.user == "{user}" || subject.isInGroup("wheel") || subject.isInGroup("sudo")) {{
+        return {{ result: polkit.Result.AUTH_ADMIN_KEEP }};
+    }}
+}});
+"""
+            # Check if already present with same content
+            need_write = True
+            try:
+                with open(rule_path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+                if "Updatifyyy persistent auth rule" in existing and user in existing:
+                    need_write = False
+            except Exception:
+                need_write = True
+            if not need_write:
+                return
+            # Write via pkexec if available, fallback to sudo
+            cmd = f"cat > {shlex.quote(rule_path)} <<'EOF'\n{rule_content}\nEOF\nchmod 644 {shlex.quote(rule_path)}"
+            if shutil.which("pkexec"):
+                subprocess.run(
+                    ["pkexec", "bash", "-c", cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            else:
+                subprocess.run(
+                    ["sudo", "bash", "-c", cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+        except Exception:
+            pass
+
+    def _plan_install_commands(self) -> list[list[str]]:
+        """
+        Simplified plan: always run files-only install.
+        """
+        self._append_log("Running files-only install.\n")
+        return [["./setup", "install-files"]]
+
     def on_install_nerd_fonts_clicked(self, _item):
         self._show_nerd_fonts_dialog()
 
     def _run_update_without_pull(self) -> None:
         # Backward compatibility: delegate to unified installer in test mode
-        self._run_installer_common(test_mode=True)
+        plan_cmds = self._plan_install_commands()
+        self._run_installer_common(test_mode=True, commands=plan_cmds)
 
     def _on_key_press(self, _widget, event) -> bool:
         # Ctrl+I triggers test update (no git pull)
@@ -901,6 +976,16 @@ class MainWindow(Gtk.ApplicationWindow):
         refresh_row.pack_start(entry_refresh, False, False, 0)
         box.pack_start(refresh_row, False, False, 0)
 
+        # Detached console toggle
+        console_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cb_detached = Gtk.CheckButton.new_with_label("Use detached installer console")
+        cb_detached.set_active(bool(SETTINGS.get("detached_console", False)))
+        cb_detached.set_tooltip_text(
+            "If enabled, installer runs in a separate window with its own interactive console."
+        )
+        console_row.pack_start(cb_detached, False, False, 0)
+        box.pack_start(console_row, False, False, 0)
+
         dialog.show_all()
         resp = dialog.run()
         if resp == Gtk.ResponseType.OK:
@@ -922,6 +1007,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 )
 
             SETTINGS["auto_refresh_seconds"] = new_refresh
+            SETTINGS["detached_console"] = cb_detached.get_active()
             _save_settings(SETTINGS)
 
             REPO_PATH = str(
@@ -992,6 +1078,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
             # Pull with streaming already handled by stream() above for consistency if needed,
             # but keep concise summary via subprocess.run to capture stdout/stderr for logs
+            # Decide installer plan based on pending commits before pulling
+            plan_cmds = self._plan_install_commands()
             pull = subprocess.run(
                 ["git", "pull", "--rebase", "--autostash", "--stat"],
                 cwd=repo_path,
@@ -1018,7 +1106,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 and os.access(setup_path, os.X_OK)
             ):
                 # Delegate to unified installer (normal mode) and return
-                self._run_installer_common(test_mode=False)
+                self._run_installer_common(test_mode=False, commands=plan_cmds)
                 # Installer delegated; legacy inline logic removed
                 return
 
@@ -1111,14 +1199,8 @@ class SetupConsole(Gtk.Window):
     and masked password entry when a sudo/password prompt is detected.
     """
 
-    PASSWORD_PATTERNS = [
-        "password for",
-        "[sudo] password",
-        "sudo password",
-        "authentication required",
-        "enter password",
-        "enter your password",
-    ]
+    # PASSWORD_PATTERNS disabled (no auto password detection)
+    PASSWORD_PATTERNS: list[str] = []
 
     def __init__(self, parent: Gtk.Window, title: str = "Setup Console"):
         super().__init__(title=title, transient_for=parent)
@@ -1146,6 +1228,12 @@ class SetupConsole(Gtk.Window):
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.add(self.textview)
         outer.pack_start(sw, True, True, 0)
+        # Ensure ANSI tags exist for console highlighting
+        try:
+            # Create a tiny hidden buffer to initialize tags used by _insert_ansi_formatted
+            _insert_ansi_formatted(self.buf, "")
+        except Exception:
+            pass
 
         # Controls
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1179,10 +1267,8 @@ class SetupConsole(Gtk.Window):
     def _apply_css(self):
         css = """
         .setup-console {
-            font-family: "JetBrainsMono NF", "JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono", "Iosevka Nerd Font", "Iosevka Term Nerd Font", "FantasqueSansMono Nerd Font", "Mononoki Nerd Font", "CaskaydiaCove Nerd Font", "SauceCodePro Nerd Font", "FiraCode Nerd Font", "FiraCode Nerd Font Mono", "Hack Nerd Font", "Cascadia Code PL", "MesloLGS NF", "Noto Sans Mono", "Noto Sans", "Noto Sans CJK SC", "Noto Sans Mono CJK SC", "Noto Sans Symbols2", "Noto Sans Symbols", "Noto Color Emoji", "Noto Emoji", "Symbols Nerd Font", "Nerd Font", "Symbola", "DejaVu Sans Mono", "DejaVu Sans", monospace;
             font-size: 12px;
             line-height: 1.25;
-            font-feature-settings: "liga" 1, "clig" 1, "calt" 1, "zero" 1, "ss01" 1;
         }
         """
         try:
@@ -1219,15 +1305,27 @@ class SetupConsole(Gtk.Window):
                     capture_stdout=True,
                 )
             else:
+                env = dict(os.environ)
+                env.update(
+                    {
+                        "TERM": "xterm-256color",
+                        "FORCE_COLOR": "1",
+                        "CLICOLOR": "1",
+                        "CLICOLOR_FORCE": "1",
+                    }
+                )
+                env.pop("NO_COLOR", None)
                 self._proc = subprocess.Popen(
                     argv,
                     cwd=cwd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
+                    env=env,
                 )
         except Exception as ex:
             self._append(f"[spawn error] {ex}\n")
@@ -1247,18 +1345,71 @@ class SetupConsole(Gtk.Window):
         for line in iter(self._proc.stdout.readline, ""):
             if not line:
                 break
-            self._append(line)
+
+            # Schedule UI mutation on main thread to avoid iterator invalidation
+            def _append_line(text_line=line):
+                try:
+                    _insert_ansi_formatted(self.buf, text_line)
+                except Exception:
+                    self._append(text_line)
+                mark = self.buf.create_mark(None, self.buf.get_end_iter(), False)
+                self.textview.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+                return False
+
+            GLib.idle_add(_append_line)
             self._maybe_password_prompt(line)
         rc = self._proc.wait()
-        self._append(f"[exit {rc}]\n")
-        GLib.idle_add(self._after_finish)
+
+        def _final():
+            try:
+                _insert_ansi_formatted(self.buf, f"[exit {rc}]\n")
+            except Exception:
+                self._append(f"[exit {rc}]\n")
+            # Remember exit code for notification logic
+            self._last_exit_code = rc
+            self._after_finish()
+            return False
+
+        GLib.idle_add(_final)
 
     def _after_finish(self):
+        # Run any supplied completion callback first
         if callable(self._finished_callback):
             try:
                 self._finished_callback()
             finally:
                 self._finished_callback = None
+        # Send desktop notification about installer result (detached console case)
+        try:
+            rc = getattr(self, "_last_exit_code", None)
+            # Prefer the window's application, fallback to global default
+            app = self.get_application()
+            if not app:
+                try:
+                    app = Gio.Application.get_default()
+                except Exception:
+                    app = None
+            if app and rc is not None:
+                notification = Gio.Notification.new(
+                    "Update successful" if rc == 0 else "Update finished (errors)"
+                )
+                body = (
+                    "Installer completed successfully."
+                    if rc == 0
+                    else f"Installer exited with code {rc}."
+                )
+                notification.set_body(body)
+                try:
+                    app.send_notification("updatifyyy-installer", notification)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Close the console window automatically after process ends
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def _on_send(self, _entry):
         txt = self.input_entry.get_text()
@@ -1269,13 +1420,24 @@ class SetupConsole(Gtk.Window):
         self.input_entry.set_text("")
 
     def _send_text(self, text: str):
-        if self._proc and self._proc.stdin:
-            try:
-                self._proc.stdin.write(text)
-                self._proc.stdin.flush()
-                self._append(f"[sent] {text}")
-            except Exception as ex:
-                self._append(f"[send error] {ex}\n")
+        p = self._proc
+        if not p:
+            return
+        try:
+            mfd = getattr(p, "_pty_master_fd", None)
+            if mfd is not None:
+                import os
+
+                os.write(mfd, text.encode("utf-8", "replace"))
+            elif p.stdin:
+                p.stdin.write(text)
+                p.stdin.flush()
+            else:
+                self._append("[send error] no stdin available\n")
+                return
+            self._append(f"[sent] {text}")
+        except Exception as ex:
+            self._append(f"[send error] {ex}\n")
 
     def _on_ctrl_c(self, _btn):
         if self._proc:
@@ -1288,40 +1450,8 @@ class SetupConsole(Gtk.Window):
                 self._append(f"[ctrl-c error] {ex}\n")
 
     def _maybe_password_prompt(self, line: str):
-        low = line.lower()
-        if any(p in low for p in self.PASSWORD_PATTERNS):
-            if self._password_cached:
-                self._append("[auto] reusing cached password\n")
-                self._send_text(self._password_cached + "\n")
-                return
-            dlg = Gtk.Dialog(
-                title="Authentication Required",
-                transient_for=self,
-                flags=0,
-            )
-            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
-            dlg.add_button("OK", Gtk.ResponseType.OK)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            box.set_border_width(12)
-            content = dlg.get_content_area()
-            content.add(box)
-            lbl = Gtk.Label(label="Enter password:")
-            lbl.set_xalign(0.0)
-            box.pack_start(lbl, False, False, 0)
-            entry = Gtk.Entry()
-            entry.set_visibility(False)
-            entry.set_invisible_char("•")
-            entry.set_activates_default(True)
-            box.pack_start(entry, False, False, 0)
-            dlg.set_default_response(Gtk.ResponseType.OK)
-            dlg.show_all()
-            resp = dlg.run()
-            pwd = entry.get_text() if resp == Gtk.ResponseType.OK else ""
-            dlg.destroy()
-            if pwd:
-                self._password_cached = pwd
-                self._send_text(pwd + "\n")
-                self._append("[auto] password sent\n")
+        # Disabled: do not auto-handle password prompts
+        return
 
     def _on_key_press(self, _widget, event) -> bool:
         if event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in (
@@ -1495,11 +1625,9 @@ class SetupConsole(Gtk.Window):
 def _init_log_css(self):
     css = """
     .log-view {
-        font-family: "JetBrainsMono NF", "JetBrainsMono Nerd Font", "JetBrainsMonoNL-Regular", "JetBrainsMonoNF-Regular", "JetBrainsMono Nerd Font Mono", "Iosevka Nerd Font", "Iosevka Term Nerd Font", "FantasqueSansMono Nerd Font", "Mononoki Nerd Font", "CaskaydiaCove Nerd Font", "Cascadia Code PL", "SauceCodePro Nerd Font", "FiraCode Nerd Font", "FiraCode Nerd Font Mono", "Hack Nerd Font", "MesloLGS NF", "Noto Sans Mono", "Noto Sans", "Noto Sans CJK SC", "Noto Sans Mono CJK SC", "Noto Sans Symbols2", "Noto Sans Symbols", "Noto Color Emoji", "Noto Emoji", "Symbols Nerd Font", "Nerd Font", "Symbola", "DejaVu Sans Mono", "DejaVu Sans", monospace;
         font-size: 12px;
         line-height: 1.25;
         white-space: pre-wrap;
-        font-feature-settings: "liga" 1, "clig" 1, "calt" 1, "zero" 1, "ss01" 1;
     }
     .ansi-bold     { font-weight: bold; }
     .ansi-dim      { opacity: 0.7; }
@@ -1531,13 +1659,6 @@ def _init_log_css(self):
             )
         if hasattr(self, "log_view"):
             self.log_view.get_style_context().add_class("log-view")
-            try:
-                ctx = self.log_view.get_pango_context()
-                if ctx:
-                    lang = Pango.Language.from_string("en")
-                    ctx.set_language(lang)
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -1554,9 +1675,9 @@ def _append_log(self, text: str):
         try:
             buf = self.log_buf
             _insert_ansi_formatted(buf, text)
-            # Auto scroll safely after insert
+            # Auto scroll safely after insert (guard destroyed widget)
             mark = buf.create_mark(None, buf.get_end_iter(), False)
-            if hasattr(self, "log_view"):
+            if hasattr(self, "log_view") and self.log_view.get_visible():
                 self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
         except Exception:
             pass
@@ -1763,86 +1884,49 @@ def _spawn_setup_install(
 
 def _insert_ansi_formatted(buf: Gtk.TextBuffer, raw: str) -> None:
     """
-    Parse ANSI escape sequences in raw text and apply tags.
-    Supports basic SGR color + style codes.
+    Parse ANSI escape sequences and apply tags without reusing invalidated iterators.
+
+    Strategy:
+    - Scan raw once, splitting into (segment, tag-set) pairs.
+    - Insert each segment capturing start_iter BEFORE insertion, end_iter AFTER insertion.
+    - Apply tags using iter ranges (no stored iter reused across buffer mutations).
     """
     import re
 
-    # Create tags once
-    tv = buf
-    tag_defs = {
-        "ansi-bold": {},
-        "ansi-dim": {},
-        "ansi-italic": {},
-        "ansi-underline": {},
-        "ansi-red": {},
-        "ansi-green": {},
-        "ansi-yellow": {},
-        "ansi-blue": {},
-        "ansi-magenta": {},
-        "ansi-cyan": {},
-        "ansi-white": {},
-        "ansi-bright-black": {},
-        "ansi-bright-red": {},
-        "ansi-bright-green": {},
-        "ansi-bright-yellow": {},
-        "ansi-bright-blue": {},
-        "ansi-bright-magenta": {},
-        "ansi-bright-cyan": {},
-        "ansi-bright-white": {},
+    # Ensure base tags exist
+    base_tags = {
+        "ansi-bold": lambda t: t.set_property("weight", Pango.Weight.BOLD),
+        "ansi-dim": lambda t: t.set_property("scale", 0.95),
+        "ansi-italic": lambda t: t.set_property("style", Pango.Style.ITALIC),
+        "ansi-underline": lambda t: t.set_property("underline", Pango.Underline.SINGLE),
+        "ansi-red": lambda t: t.set_property("foreground", "#ff5555"),
+        "ansi-green": lambda t: t.set_property("foreground", "#50fa7b"),
+        "ansi-yellow": lambda t: t.set_property("foreground", "#f1fa8c"),
+        "ansi-blue": lambda t: t.set_property("foreground", "#8be9fd"),
+        "ansi-magenta": lambda t: t.set_property("foreground", "#ff79c6"),
+        "ansi-cyan": lambda t: t.set_property("foreground", "#66d9ef"),
+        "ansi-white": lambda t: t.set_property("foreground", "#f8f8f2"),
+        "ansi-bright-black": lambda t: t.set_property("foreground", "#6272a4"),
+        "ansi-bright-red": lambda t: t.set_property("foreground", "#ff6e6e"),
+        "ansi-bright-green": lambda t: t.set_property("foreground", "#69ff94"),
+        "ansi-bright-yellow": lambda t: t.set_property("foreground", "#ffffa5"),
+        "ansi-bright-blue": lambda t: t.set_property("foreground", "#9aedfe"),
+        "ansi-bright-magenta": lambda t: t.set_property("foreground", "#ff92df"),
+        "ansi-bright-cyan": lambda t: t.set_property("foreground", "#82e9ff"),
+        "ansi-bright-white": lambda t: t.set_property("foreground", "#ffffff"),
     }
-    for name, props in tag_defs.items():
-        if tv.get_tag_table().lookup(name) is None:
-            tag = Gtk.TextTag.new(name)
-            if name == "ansi-bold":
-                tag.set_property("weight", Pango.Weight.BOLD)
-            elif name == "ansi-dim":
-                tag.set_property("scale", 0.95)
-            elif name == "ansi-italic":
-                tag.set_property("style", Pango.Style.ITALIC)
-            elif name == "ansi-underline":
-                tag.set_property("underline", Pango.Underline.SINGLE)
-            elif name == "ansi-red":
-                tag.set_property("foreground", "#ff5555")
-            elif name == "ansi-green":
-                tag.set_property("foreground", "#50fa7b")
-            elif name == "ansi-yellow":
-                tag.set_property("foreground", "#f1fa8c")
-            elif name == "ansi-blue":
-                tag.set_property("foreground", "#8be9fd")
-            elif name == "ansi-magenta":
-                tag.set_property("foreground", "#ff79c6")
-            elif name == "ansi-cyan":
-                tag.set_property("foreground", "#66d9ef")
-            elif name == "ansi-white":
-                tag.set_property("foreground", "#f8f8f2")
-            elif name == "ansi-bright-black":
-                tag.set_property("foreground", "#6272a4")
-            elif name == "ansi-bright-red":
-                tag.set_property("foreground", "#ff6e6e")
-            elif name == "ansi-bright-green":
-                tag.set_property("foreground", "#69ff94")
-            elif name == "ansi-bright-yellow":
-                tag.set_property("foreground", "#ffffa5")
-            elif name == "ansi-bright-blue":
-                tag.set_property("foreground", "#9aedfe")
-            elif name == "ansi-bright-magenta":
-                tag.set_property("foreground", "#ff92df")
-            elif name == "ansi-bright-cyan":
-                tag.set_property("foreground", "#82e9ff")
-            elif name == "ansi-bright-white":
-                tag.set_property("foreground", "#ffffff")
-            tv.get_tag_table().add(tag)
-    # Match full ANSI SGR sequences including 38;5;<n>, 48;5;<n>, and reset
-    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
-    # Mapping SGR codes to tag classes
+    tag_table = buf.get_tag_table()
+    for name, init in base_tags.items():
+        if tag_table.lookup(name) is None:
+            tg = Gtk.TextTag.new(name)
+            init(tg)
+            tag_table.add(tg)
+
     sgr_map = {
-        # Styles
         "1": "ansi-bold",
         "2": "ansi-dim",
         "3": "ansi-italic",
         "4": "ansi-underline",
-        # 30-37 normal fg
         "30": "ansi-bright-black",
         "31": "ansi-red",
         "32": "ansi-green",
@@ -1851,7 +1935,6 @@ def _insert_ansi_formatted(buf: Gtk.TextBuffer, raw: str) -> None:
         "35": "ansi-magenta",
         "36": "ansi-cyan",
         "37": "ansi-white",
-        # 90-97 bright fg
         "90": "ansi-bright-black",
         "91": "ansi-bright-red",
         "92": "ansi-bright-green",
@@ -1861,7 +1944,6 @@ def _insert_ansi_formatted(buf: Gtk.TextBuffer, raw: str) -> None:
         "96": "ansi-bright-cyan",
         "97": "ansi-bright-white",
     }
-    # Background color mapping (simple and bright)
     bg_map = {
         "40": "#000000",
         "41": "#ff5555",
@@ -1880,102 +1962,100 @@ def _insert_ansi_formatted(buf: Gtk.TextBuffer, raw: str) -> None:
         "106": "#82e9ff",
         "107": "#ffffff",
     }
+
+    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
     pos = 0
-    active_tags = []
-    for m in ansi_re.finditer(raw):
-        segment = raw[pos : m.start()]
+    active = []
+
+    def ensure_xterm_tag(kind: str, idx: int) -> str:
+        name = f"ansi-xterm-{kind}-{idx}"
+        if tag_table.lookup(name) is None:
+            # Build color
+            def xterm_color(n: int) -> str:
+                if n < 16:
+                    base = [
+                        "#000000",
+                        "#800000",
+                        "#008000",
+                        "#808000",
+                        "#000080",
+                        "#800080",
+                        "#008080",
+                        "#c0c0c0",
+                        "#808080",
+                        "#ff0000",
+                        "#00ff00",
+                        "#ffff00",
+                        "#0000ff",
+                        "#ff00ff",
+                        "#00ffff",
+                        "#ffffff",
+                    ]
+                    return base[n]
+                if 16 <= n <= 231:
+                    n -= 16
+                    r = (n // 36) % 6
+                    g = (n // 6) % 6
+                    b = n % 6
+                    conv = [0, 95, 135, 175, 215, 255]
+                    return f"#{conv[r]:02x}{conv[g]:02x}{conv[b]:02x}"
+                level = 8 + (n - 232) * 10
+                return f"#{level:02x}{level:02x}{level:02x}"
+
+            col = xterm_color(idx)
+            tg = Gtk.TextTag.new(name)
+            if kind == "38":
+                tg.set_property("foreground", col)
+            else:
+                tg.set_property("background", col)
+            tag_table.add(tg)
+        return name
+
+    while True:
+        m = ansi_re.search(raw, pos)
+        segment = raw[pos : m.start()] if m else raw[pos:]
         if segment:
-            start_mark = buf.create_mark(None, buf.get_end_iter(), True)
+            # compute offsets to avoid invalid iterators
+            start_offset = buf.get_char_count()
             buf.insert(buf.get_end_iter(), segment)
-            end_iter2 = buf.get_end_iter()
-            for t in active_tags:
-                tag_obj = buf.get_tag_table().lookup(t)
-                if tag_obj:
-                    buf.apply_tag(tag_obj, buf.get_iter_at_mark(start_mark), end_iter2)
+            end_offset = buf.get_char_count()
+            start_iter = buf.get_iter_at_offset(start_offset)
+            end_iter = buf.get_iter_at_offset(end_offset)
+            for t in active:
+                tg = tag_table.lookup(t)
+                if tg:
+                    buf.apply_tag(tg, start_iter, end_iter)
+        if not m:
+            break
         seq = m.group()
         codes = seq[2:-1].split(";") if seq != "\x1b[m" else []
         if not codes or any(c == "0" for c in codes):
-            active_tags = []
+            active = []
         else:
-            # Support 256-color foreground/background: 38;5;<n>, 48;5;<n>
             i = 0
             while i < len(codes):
                 c = codes[i]
                 if c in ("38", "48") and i + 2 < len(codes) and codes[i + 1] == "5":
                     try:
-                        color_index = int(codes[i + 2])
-                        tag_name = f"ansi-xterm-{c}-{color_index}"
-                        if buf.get_tag_table().lookup(tag_name) is None:
-                            # Compute xterm 256-color palette RGB
-                            def _xterm_color(n: int) -> str:
-                                if n < 16:
-                                    # Basic colors approximated
-                                    base = [
-                                        "#000000",
-                                        "#800000",
-                                        "#008000",
-                                        "#808000",
-                                        "#000080",
-                                        "#800080",
-                                        "#008080",
-                                        "#c0c0c0",
-                                        "#808080",
-                                        "#ff0000",
-                                        "#00ff00",
-                                        "#ffff00",
-                                        "#0000ff",
-                                        "#ff00ff",
-                                        "#00ffff",
-                                        "#ffffff",
-                                    ]
-                                    return base[n]
-                                if 16 <= n <= 231:
-                                    n -= 16
-                                    r = (n // 36) % 6
-                                    g = (n // 6) % 6
-                                    b = n % 6
-                                    conv = [0, 95, 135, 175, 215, 255]
-                                    return f"#{conv[r]:02x}{conv[g]:02x}{conv[b]:02x}"
-                                # Grayscale 232–255
-                                level = 8 + (n - 232) * 10
-                                return f"#{level:02x}{level:02x}{level:02x}"
-
-                            fg_hex = _xterm_color(color_index)
-                            tag = Gtk.TextTag.new(tag_name)
-                            if c == "38":
-                                tag.set_property("foreground", fg_hex)
-                            else:
-                                tag.set_property("background", fg_hex)
-                            buf.get_tag_table().add(tag)
-                        active_tags.append(tag_name)
+                        idx = int(codes[i + 2])
+                        active.append(ensure_xterm_tag(c, idx))
                     except Exception:
                         pass
                     i += 3
                     continue
-                tag = sgr_map.get(c)
-                if tag and tag not in active_tags:
-                    active_tags.append(tag)
+                mapped = sgr_map.get(c)
+                if mapped and mapped not in active:
+                    active.append(mapped)
                 elif c in bg_map:
-                    tag_name = f"ansi-bg-{c}"
-                    if buf.get_tag_table().lookup(tag_name) is None:
-                        tag_obj = Gtk.TextTag.new(tag_name)
-                        tag_obj.set_property("background", bg_map[c])
-                        buf.get_tag_table().add(tag_obj)
-                    active_tags.append(tag_name)
+                    name = f"ansi-bg-{c}"
+                    if tag_table.lookup(name) is None:
+                        tg = Gtk.TextTag.new(name)
+                        tg.set_property("background", bg_map[c])
+                        tag_table.add(tg)
+                    if name not in active:
+                        active.append(name)
                 i += 1
         pos = m.end()
-    # Remainder
-    remainder = raw[pos:]
-    if remainder:
-        start_mark = buf.create_mark(None, buf.get_end_iter(), True)
-        buf.insert(buf.get_end_iter(), remainder)
-        end_iter2 = buf.get_end_iter()
-        for t in active_tags:
-            tag_obj = buf.get_tag_table().lookup(t)
-            if tag_obj:
-                buf.apply_tag(tag_obj, buf.get_iter_at_mark(start_mark), end_iter2)
-    # Ensure trailing newline formatting
-    return
 
 
 def _fetch_github_avatar_url(email: str) -> str:
@@ -2055,140 +2135,327 @@ def show_details_dialog(
     dialog.destroy()
 
 
-def on_view_changes_clicked(window: Gtk.Window) -> None:
+def on_view_changes_quick(window: Gtk.Window) -> None:
+    """
+    Faster, cleaner changes window that opens immediately and fills asynchronously.
+    - Shows commit avatar, subject, author, date and 'ago'
+    - If > 15 commits, shows a search box to filter results live
+    - Incremental, lazy rendering with per-row reveal animation and lazy avatar fetch
+    """
     st = getattr(window, "_status", None)
     if not (st and st.upstream):
         show_details_dialog(window, "Changes", "No updates available", "")
         return
-
     repo_path = st.repo_path
     upstream = st.upstream
 
-    def fetch_commits():
-        rc, out, err = run_git(
-            [
-                "log",
-                "--pretty=format:%H|%h|%an|%ae|%ad|%s",
-                "--date=short",
-                f"HEAD..{upstream}",
-            ],
-            repo_path,
-        )
-        if rc != 0:
-            return None, err or "Failed to load commits."
-        lines = [line for line in out.splitlines() if line.strip()]
-        commits = []
-        for line in lines:
-            parts = line.split("|", 5)
-            if len(parts) == 6:
-                full, short, author, email, date, subject = parts
-                commits.append(
-                    {
-                        "full": full,
-                        "short": short,
-                        "author": author,
-                        "email": email,
-                        "date": date,
-                        "subject": subject,
-                        "avatar": _fetch_github_avatar_url(email),
-                    }
-                )
-        return commits, None
-
-    commits, error = fetch_commits()
-    if error:
-        show_details_dialog(window, "Changes", "Error", error)
-        return
-    if not commits:
-        show_details_dialog(window, "Changes", "No pending commits", "")
-        return
-
-    dialog = Gtk.Dialog(title="Pending Commits", transient_for=window, flags=0)
+    dialog = Gtk.Window(title="Pending Commits")
+    dialog.set_transient_for(window)
     dialog.set_modal(True)
-    dialog.set_resizable(True)
-    # Dynamic sizing based on content: approximate width from longest subject length
-    max_subject = max((len(c["subject"]) for c in commits), default=0)
-    # Rough char->px scaling factor; clamp for sanity
-    base_width = 560 + min(max_subject, 140) * 3
-    width = max(640, min(base_width, 1100))
-    # Height scales with number of commits; clamp
-    height = max(360, min(120 + 40 * len(commits), 800))
-    dialog.set_default_size(width, height)
-    dialog.maximize()
-    dialog.add_button("Close", Gtk.ResponseType.CLOSE)
+    dialog.set_default_size(1100, 760)
 
-    area = dialog.get_content_area()
     outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
     outer.set_border_width(12)
-    area.add(outer)
+    dialog.add(outer)
 
     header = Gtk.Label()
-    header.set_markup(f"<b>{len(commits)} commit(s) to pull</b>")
+    header.set_markup("<b>Loading commits…</b>")
     header.set_xalign(0.0)
     outer.pack_start(header, False, False, 0)
+
+    tools_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    tools_box.set_hexpand(True)
+    outer.pack_start(tools_box, False, False, 0)
+    search_entry = Gtk.SearchEntry()
+    search_entry.set_placeholder_text("Search commits…")
+    search_entry.set_hexpand(True)
+    search_entry.hide()
+    tools_box.pack_start(search_entry, True, True, 0)
 
     sw = Gtk.ScrolledWindow()
     sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
     outer.pack_start(sw, True, True, 0)
 
-    list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-    list_box.set_hexpand(True)
-    list_box.set_vexpand(True)
+    list_box = Gtk.ListBox()
+    list_box.set_selection_mode(Gtk.SelectionMode.NONE)
     sw.add(list_box)
 
-    for c in commits:
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        avatar_img = _make_avatar_image(c["avatar"])
-        row.pack_start(avatar_img, False, False, 0)
+    # Apply CSS for rounded avatar backgrounds
+    try:
+        provider = Gtk.CssProvider()
+        provider.load_from_data(b"""
+        .avatar-bg {
+            background-color: #2e3440;
+            border-radius: 9999px;
+            padding: 2px;
+        }
+        """)
+        screen = Gdk.Screen.get_default()
+        if screen:
+            Gtk.StyleContext.add_provider_for_screen(
+                screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+    except Exception:
+        pass
+    dialog.show_all()
 
-        meta_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    commits_data: list[dict] = []
+    row_widgets: list[Gtk.Widget] = []
+
+    def format_ago(iso_str: str) -> str:
+        # Expect ISO-like date from git: "YYYY-MM-DD HH:MM:SS +/-HHMM"
+        try:
+            import time as _t
+
+            try:
+                ts = _t.mktime(_t.strptime(iso_str[:19], "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                # Fallback: short date only
+                ts = _t.mktime(_t.strptime(iso_str[:10], "%Y-%m-%d"))
+            now = _t.time()
+            delta = max(0, int(now - ts))
+            if delta < 60:
+                return f"{delta}s ago"
+            if delta < 3600:
+                return f"{delta // 60}m ago"
+            if delta < 86400:
+                return f"{delta // 3600}h ago"
+            days = delta // 86400
+            return f"{days}d ago"
+        except Exception:
+            return iso_str
+
+    def guess_github_avatar(email: str) -> str:
+        # Try to extract username for GitHub-hosted emails, else fallback to local-part guess
+        em = email or ""
+        local = em.split("@")[0]
+        if em.endswith("@users.noreply.github.com"):
+            # Formats: 12345+username@users.noreply.github.com or username@users.noreply.github.com
+            if "+" in local:
+                user = local.split("+", 1)[1]
+            else:
+                user = local
+            return f"https://github.com/{user}.png"
+        # Fallback to existing heuristic
+        return f"https://github.com/{local}.png" if local else ""
+
+    def build_row(c: dict) -> Gtk.Widget:
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row.set_hexpand(True)
+
+        # Placeholder avatar inside rounded background container; lazy-load actual GitHub avatar
+        avatar_bg = Gtk.EventBox()
+        avatar_bg.set_size_request(36, 36)
+        avatar_bg.get_style_context().add_class("avatar-bg")
+        avatar = Gtk.Image.new_from_icon_name(
+            "avatar-default-symbolic", Gtk.IconSize.MENU
+        )
+        avatar_bg.add(avatar)
+        row.pack_start(avatar_bg, False, False, 0)
+
+        meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        meta.set_hexpand(True)
+
+        # First line: short hash + subject
         subject_lbl = Gtk.Label()
         subject_lbl.set_xalign(0.0)
         subject_lbl.set_line_wrap(True)
         subject_lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        subject_lbl.set_markup(
-            f"<span foreground='#00ace6'>{GLib.markup_escape_text(c['short'])}</span> {GLib.markup_escape_text(c['subject'])}"
+        subject_lbl.set_use_markup(True)
+        subject_markup = (
+            f"<span foreground='#00ace6'>{GLib.markup_escape_text(c.get('short', ''))}</span> "
+            f"{GLib.markup_escape_text(c.get('subject', ''))}"
         )
-        meta_box.pack_start(subject_lbl, False, False, 0)
+        subject_lbl.set_markup(subject_markup)
+        meta.pack_start(subject_lbl, False, False, 0)
 
+        # Second line: author — date (ago)
         info_lbl = Gtk.Label()
         info_lbl.set_xalign(0.0)
-        info_lbl.set_markup(
-            f"<small>{GLib.markup_escape_text(c['author'])} — {GLib.markup_escape_text(c['date'])}</small>"
+        info_lbl.set_use_markup(True)
+        ago = format_ago(c.get("date_iso", c.get("date", "")))
+        info_markup = (
+            f"<small>{GLib.markup_escape_text(c.get('author', ''))} — "
+            f"{GLib.markup_escape_text(c.get('date', ''))} ({GLib.markup_escape_text(ago)})</small>"
         )
-        meta_box.pack_start(info_lbl, False, False, 0)
+        info_lbl.set_markup(info_markup)
+        meta.pack_start(info_lbl, False, False, 0)
 
-        row.pack_start(meta_box, True, True, 0)
-        list_box.pack_start(row, False, False, 0)
-    dialog.show_all()
-    dialog.run()
-    dialog.destroy()
+        row.pack_start(meta, True, True, 0)
 
-    # Show busy indicator
-    if hasattr(window, "_busy"):
-        window._busy(True, "Loading commit list...")
+        # Lazy-load avatar in a background thread and update on idle
+        def load_avatar():
+            try:
+                url = c.get("avatar") or guess_github_avatar(c.get("email", ""))
+                if not url:
+                    return
+                import urllib.request
 
-    repo_path = st.repo_path
-    upstream = st.upstream
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    data = resp.read()
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(data)
+                loader.close()
+                pixbuf = loader.get_pixbuf()
+                if pixbuf:
+
+                    def set_img():
+                        try:
+                            import math
+
+                            import cairo
+
+                            size = 32
+                            scaled = (
+                                pixbuf.scale_simple(
+                                    size, size, GdkPixbuf.InterpType.BILINEAR
+                                )
+                                or pixbuf
+                            )
+                            surface = cairo.ImageSurface(
+                                cairo.FORMAT_ARGB32, size, size
+                            )
+                            ctx = cairo.Context(surface)
+                            ctx.arc(size / 2.0, size / 2.0, size / 2.0, 0, 2 * math.pi)
+                            ctx.clip()
+                            Gdk.cairo_set_source_pixbuf(ctx, scaled, 0, 0)
+                            ctx.paint()
+                            rounded = Gdk.pixbuf_get_from_surface(
+                                surface, 0, 0, size, size
+                            )
+                            if rounded:
+                                avatar.set_from_pixbuf(rounded)
+                            else:
+                                avatar.set_from_pixbuf(scaled)
+                        except Exception:
+                            avatar.set_from_pixbuf(pixbuf)
+                        return False
+
+                    GLib.idle_add(set_img)
+            except Exception:
+                pass
+
+        threading.Thread(target=load_avatar, daemon=True).start()
+
+        row.show_all()
+        return row
+
+    def apply_filter(_entry):
+        q = search_entry.get_text().strip().lower()
+        children = list_box.get_children()
+        if not q:
+            for ch in children:
+                ch.show()
+            return
+        for i, ch in enumerate(children):
+            if i >= len(commits_data):
+                ch.hide()
+                continue
+            c = commits_data[i]
+            hay = " ".join(
+                [
+                    c.get("short", ""),
+                    c.get("subject", ""),
+                    c.get("author", ""),
+                    c.get("date", ""),
+                ]
+            ).lower()
+            if q in hay:
+                ch.show()
+            else:
+                ch.hide()
 
     def work():
         rc, out, err = run_git(
             [
                 "log",
-                "--pretty=format:%h  %ad  %s  (%an)",
-                "--date=short",
+                "--pretty=format:%H|%h|%an|%ae|%ad|%s",
+                "--date=iso",
                 f"HEAD..{upstream}",
             ],
             repo_path,
         )
-        text = out if rc == 0 else (err or "Failed to load commits.")
+        if rc != 0:
+            commits = None
+            error = err or "Failed to load commits."
+        else:
+            lines = [ln for ln in out.splitlines() if ln.strip()]
+            commits = []
+            for ln in lines:
+                parts = ln.split("|", 5)
+                if len(parts) == 6:
+                    full, short, author, email, date_iso, subject = parts
+                    commits.append(
+                        {
+                            "full": full,
+                            "short": short,
+                            "author": author,
+                            "email": email,
+                            "date": date_iso.split(" ")[0],
+                            "date_iso": date_iso,
+                            "subject": subject,
+                            "avatar": guess_github_avatar(email),
+                        }
+                    )
+            error = None
 
         def done():
-            if hasattr(window, "_busy"):
-                window._busy(False, "")
-            title = "Pending commits" if rc == 0 else "Error loading commits"
-            summary = f"{st.behind} commit(s) will be pulled" if rc == 0 else ""
-            show_details_dialog(window, title, summary, text.strip())
+            if error:
+                header.set_markup("<b>Error</b>")
+                # Show error in a single row label
+                list_box.foreach(lambda w: list_box.remove(w))
+                lbl = Gtk.Label(label=error)
+                lbl.set_xalign(0.0)
+                list_box.add(lbl)
+                dialog.show_all()
+                return
+
+            nonlocal commits_data
+            commits_data = commits or []
+            header.set_markup(f"<b>{len(commits_data)} commit(s) to pull</b>")
+
+            # Clear list and incrementally add rows with reveal animation
+            list_box.foreach(lambda w: list_box.remove(w))
+            row_widgets.clear()
+
+            index = {"i": 0}
+
+            def add_next():
+                i = index["i"]
+                if i >= len(commits_data):
+                    # Enable search if many
+                    if len(commits_data) > 15:
+                        search_entry.show()
+                        search_entry.connect("changed", apply_filter)
+                    return False
+                c = commits_data[i]
+                index["i"] = i + 1
+
+                # Build row and wrap in revealer for animation
+                row = build_row(c)
+                revealer = Gtk.Revealer()
+                revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
+                revealer.set_transition_duration(160)
+                revealer.add(row)
+                revealer.set_reveal_child(False)
+                list_box.add(revealer)
+                row_widgets.append(revealer)
+                list_box.show_all()
+
+                # Reveal after a tiny delay to animate
+                def _reveal():
+                    revealer.set_reveal_child(True)
+                    return False
+
+                GLib.timeout_add(30, _reveal)
+
+                # Queue next row addition
+                GLib.timeout_add(25, add_next)
+                return False
+
+            # Kick off incremental rendering
+            GLib.idle_add(add_next)
+            return False
 
         GLib.idle_add(done)
 
@@ -2205,23 +2472,9 @@ def launch_install_external(repo_path: str) -> None:
         ("konsole", ["konsole", "-e"]),
         ("foot", ["foot", "sh", "-c"]),
     ]
-    # Ensure setup script uses polkitexec wrappers (polkit via pkexec)
+    # No script patching; rely on sudo -v keepalive
     try:
-        setup_path = os.path.join(repo_path, "setup")
-        if os.path.isfile(setup_path) and os.access(setup_path, os.R_OK):
-            with open(setup_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            if "UPDATIFYYY_POLKIT_PATCHED" not in content:
-                header = '# UPDATIFYYY_POLKIT_PATCHED\npolkitexec() { command -v pkexec >/dev/null 2>&1 && pkexec "$@" || "$@"; }\n'
-                content = header + content
-            # Replace 'sudo ' with 'polkitexec '
-            content = re.sub(r"(?m)(?<![\\w-])sudo\\s+", "polkitexec ", content)
-            # Replace 'yay ' with 'polkitexec yay '
-            content = re.sub(r"(?m)(?<![\\w-])yay\\s+", "polkitexec yay ", content)
-            with open(setup_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            # Ensure executable bit
-            os.chmod(setup_path, os.stat(setup_path).st_mode | 0o111)
+        pass
     except Exception:
         pass
     cmd = ["./setup", "install"]
