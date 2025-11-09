@@ -49,7 +49,13 @@ def _load_settings() -> dict:
     data = {
         "repo_path": os.path.expanduser("~/dots-hyprland"),
         "auto_refresh_seconds": 60,
-        "detached_console": False,  # new setting: run installer in separate window
+        "detached_console": False,  # run installer in separate window
+        "installer_mode": "files-only",  # "files-only" or "full"
+        "use_pty": True,  # PTY for embedded console
+        "force_color_env": True,  # force TERM/CLICOLOR env for color
+        "send_notifications": True,  # desktop notifications on finish
+        "log_max_lines": 5000,  # trim logs to this many lines (0 to disable)
+        "changes_lazy_load": True,  # lazy load commits with animations
     }
     try:
         if os.path.isfile(SETTINGS_FILE):
@@ -516,7 +522,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             extra_args=cmd[1:],
                             capture_stdout=True,
                             auto_input_seq=[],
-                            use_pty=True,
+                            use_pty=bool(SETTINGS.get("use_pty", True)),
                         )
                         self._current_proc = p
                         if p and p.stdout:
@@ -535,15 +541,16 @@ class MainWindow(Gtk.ApplicationWindow):
                             fallback_cmd = ["bash"] + cmd
                             self._append_log(f"[fallback] {' '.join(fallback_cmd)}\n")
                             env = dict(os.environ)
-                            env.update(
-                                {
-                                    "TERM": "xterm-256color",
-                                    "FORCE_COLOR": "1",
-                                    "CLICOLOR": "1",
-                                    "CLICOLOR_FORCE": "1",
-                                }
-                            )
-                            env.pop("NO_COLOR", None)
+                            if bool(SETTINGS.get("force_color_env", True)):
+                                env.update(
+                                    {
+                                        "TERM": "xterm-256color",
+                                        "FORCE_COLOR": "1",
+                                        "CLICOLOR": "1",
+                                        "CLICOLOR_FORCE": "1",
+                                    }
+                                )
+                                env.pop("NO_COLOR", None)
                             p2 = subprocess.Popen(
                                 fallback_cmd,
                                 cwd=repo_path,
@@ -758,7 +765,11 @@ polkit.addRule(function(action, subject) {{
         """
         Simplified plan: always run files-only install.
         """
-        self._append_log("Running files-only install.\n")
+        mode = str(SETTINGS.get("installer_mode", "files-only"))
+        if mode == "full":
+            self._append_log("Installer mode: full install.\n")
+            return [["./setup", "install"]]
+        self._append_log("Installer mode: files-only.\n")
         return [["./setup", "install-files"]]
 
     def on_install_nerd_fonts_clicked(self, _item):
@@ -986,6 +997,58 @@ polkit.addRule(function(action, subject) {{
         console_row.pack_start(cb_detached, False, False, 0)
         box.pack_start(console_row, False, False, 0)
 
+        # Installer mode
+        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl_mode = Gtk.Label(label="Installer mode:")
+        lbl_mode.set_xalign(0.0)
+        mode_row.pack_start(lbl_mode, False, False, 0)
+        cmb_mode = Gtk.ComboBoxText()
+        cmb_mode.append_text("files-only")
+        cmb_mode.append_text("full")
+        current_mode = str(SETTINGS.get("installer_mode", "files-only"))
+        if current_mode not in ("files-only", "full"):
+            current_mode = "files-only"
+        cmb_mode.set_active(0 if current_mode == "files-only" else 1)
+        mode_row.pack_start(cmb_mode, False, False, 0)
+        box.pack_start(mode_row, False, False, 0)
+
+        # Console options
+        console_opts = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        cb_pty = Gtk.CheckButton.new_with_label("Embedded console: use PTY")
+        cb_pty.set_active(bool(SETTINGS.get("use_pty", True)))
+        console_opts.pack_start(cb_pty, False, False, 0)
+
+        cb_color = Gtk.CheckButton.new_with_label("Force color environment")
+        cb_color.set_active(bool(SETTINGS.get("force_color_env", True)))
+        cb_color.set_tooltip_text(
+            "Sets TERM/CLICOLOR/CLICOLOR_FORCE for colorized output"
+        )
+        console_opts.pack_start(cb_color, False, False, 0)
+
+        cb_notify = Gtk.CheckButton.new_with_label("Send notifications")
+        cb_notify.set_active(bool(SETTINGS.get("send_notifications", True)))
+        console_opts.pack_start(cb_notify, False, False, 0)
+        box.pack_start(console_opts, False, False, 0)
+
+        # Log options
+        log_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        lbl_log = Gtk.Label(label="Max log lines (0=unlimited):")
+        lbl_log.set_xalign(0.0)
+        log_row.pack_start(lbl_log, False, False, 0)
+        spin_log = Gtk.SpinButton()
+        spin_log.set_range(0, 100000)
+        spin_log.set_increments(100, 1000)
+        spin_log.set_value(float(int(SETTINGS.get("log_max_lines", 5000))))
+        log_row.pack_start(spin_log, False, False, 0)
+        box.pack_start(log_row, False, False, 0)
+
+        # Changes view options
+        changes_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        cb_lazy = Gtk.CheckButton.new_with_label("Lazy load commits with animations")
+        cb_lazy.set_active(bool(SETTINGS.get("changes_lazy_load", True)))
+        changes_row.pack_start(cb_lazy, False, False, 0)
+        box.pack_start(changes_row, False, False, 0)
+
         dialog.show_all()
         resp = dialog.run()
         if resp == Gtk.ResponseType.OK:
@@ -1008,6 +1071,18 @@ polkit.addRule(function(action, subject) {{
 
             SETTINGS["auto_refresh_seconds"] = new_refresh
             SETTINGS["detached_console"] = cb_detached.get_active()
+            # Advanced settings
+            SETTINGS["installer_mode"] = (
+                "files-only" if cmb_mode.get_active() == 0 else "full"
+            )
+            SETTINGS["use_pty"] = cb_pty.get_active()
+            SETTINGS["force_color_env"] = cb_color.get_active()
+            SETTINGS["send_notifications"] = cb_notify.get_active()
+            try:
+                SETTINGS["log_max_lines"] = int(spin_log.get_value())
+            except Exception:
+                pass
+            SETTINGS["changes_lazy_load"] = cb_lazy.get_active()
             _save_settings(SETTINGS)
 
             REPO_PATH = str(
@@ -1354,6 +1429,17 @@ class SetupConsole(Gtk.Window):
                     self._append(text_line)
                 mark = self.buf.create_mark(None, self.buf.get_end_iter(), False)
                 self.textview.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+                # Trim console lines if limit configured
+                try:
+                    limit = int(SETTINGS.get("log_max_lines", 0))
+                    if limit and self.buf.get_line_count() > limit:
+                        s_it = self.buf.get_start_iter()
+                        e_it = self.buf.get_iter_at_line(
+                            self.buf.get_line_count() - limit
+                        )
+                        self.buf.delete(s_it, e_it)
+                except Exception:
+                    pass
                 return False
 
             GLib.idle_add(_append_line)
@@ -1389,7 +1475,11 @@ class SetupConsole(Gtk.Window):
                     app = Gio.Application.get_default()
                 except Exception:
                     app = None
-            if app and rc is not None:
+            if (
+                app
+                and rc is not None
+                and bool(SETTINGS.get("send_notifications", True))
+            ):
                 notification = Gio.Notification.new(
                     "Update successful" if rc == 0 else "Update finished (errors)"
                 )
@@ -1679,6 +1769,15 @@ def _append_log(self, text: str):
             mark = buf.create_mark(None, buf.get_end_iter(), False)
             if hasattr(self, "log_view") and self.log_view.get_visible():
                 self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+            # Trim log lines if limit configured
+            try:
+                limit = int(SETTINGS.get("log_max_lines", 0))
+                if limit and buf.get_line_count() > limit:
+                    start_it = buf.get_start_iter()
+                    end_it = buf.get_iter_at_line(buf.get_line_count() - limit)
+                    buf.delete(start_it, end_it)
+            except Exception:
+                pass
         except Exception:
             pass
         return False  # ensure idle handler runs only once
