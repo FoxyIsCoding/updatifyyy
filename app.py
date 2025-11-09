@@ -39,7 +39,7 @@ from gi.repository import (
 )
 
 APP_ID = "com.example.updatifyyy"
-APP_TITLE = "Updatify"
+APP_TITLE = "illogical-updots"
 # Settings (persisted)
 SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "updatifyyy")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
@@ -210,7 +210,8 @@ class MainWindow(Gtk.ApplicationWindow):
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         hb.props.title = APP_TITLE
-        hb.props.subtitle = REPO_PATH
+        self.header_bar = hb
+        self.header_bar.props.subtitle = REPO_PATH
         self.set_titlebar(hb)
 
         # Refresh button on the left (start)
@@ -243,6 +244,10 @@ class MainWindow(Gtk.ApplicationWindow):
         mi_fonts = Gtk.MenuItem(label="Install Nerd Fonts")
         mi_fonts.connect("activate", self.on_install_nerd_fonts_clicked)
         menu.append(mi_fonts)
+
+        mi_about = Gtk.MenuItem(label="About")
+        mi_about.connect("activate", self.on_about_clicked)
+        menu.append(mi_about)
 
         menu.show_all()
 
@@ -1090,6 +1095,71 @@ polkit.addRule(function(action, subject) {{
     def on_settings_clicked(self, _btn: Gtk.Button) -> None:
         self._show_settings_dialog()
 
+    def on_about_clicked(self, _item) -> None:
+        self._show_about_dialog()
+
+    def _show_about_dialog(self) -> None:
+        dialog = Gtk.Window(title=f"About {APP_TITLE}")
+        dialog.set_transient_for(self)
+        dialog.set_modal(True)
+        dialog.set_default_size(700, 520)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_border_width(16)
+        dialog.add(outer)
+
+        header = Gtk.Label()
+        header.set_use_markup(True)
+        header.set_markup(
+            f"<span size='xx-large' weight='bold'>{GLib.markup_escape_text(APP_TITLE)}</span>"
+        )
+        header.set_xalign(0.0)
+        outer.pack_start(header, False, False, 0)
+
+        subtitle = Gtk.Label()
+        subtitle.set_use_markup(True)
+        subtitle.set_markup(
+            "<span size='large'>A simple GTK3 app to check a git repo for updates, "
+            "show changes, and run your installer with an interactive console.</span>"
+        )
+        subtitle.set_xalign(0.0)
+        subtitle.set_line_wrap(True)
+        subtitle.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        outer.pack_start(subtitle, False, False, 0)
+
+        info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        info_box.set_hexpand(True)
+        outer.pack_start(info_box, False, False, 0)
+
+        path_lbl = Gtk.Label()
+        path_lbl.set_xalign(0.0)
+        path_lbl.set_use_markup(True)
+        repo_txt = str(SETTINGS.get("repo_path") or REPO_PATH)
+        path_lbl.set_markup(f"<b>Repository:</b> {GLib.markup_escape_text(repo_txt)}")
+        info_box.pack_start(path_lbl, False, False, 0)
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.set_min_content_height(320)
+        outer.pack_start(sw, True, True, 0)
+
+        body = Gtk.TextView()
+        body.set_editable(False)
+        body.set_cursor_visible(False)
+        body.set_monospace(True)
+        buf = body.get_buffer()
+        buf.set_text(
+            "Features:\n"
+            " - Detects when your local branch is behind its upstream\n"
+            " - Shows a changes view with avatars and animations\n"
+            " - Provides an interactive embedded console with color output\n"
+            " - Runs your setup installer and an optional post-install script\n\n"
+            "Tip: Configure the repository path and options in Settings."
+        )
+        sw.add(body)
+
+        dialog.show_all()
+
     def _show_logs_dialog(self) -> None:
         if not self._update_logs:
             show_details_dialog(self, "Git Logs", "No update logs yet.", "")
@@ -1338,6 +1408,11 @@ polkit.addRule(function(action, subject) {{
             )
 
             # Refresh now to reflect new path
+            if hasattr(self, "header_bar"):
+                try:
+                    self.header_bar.props.subtitle = REPO_PATH
+                except Exception:
+                    pass
             self.refresh_status()
         dialog.destroy()
 
