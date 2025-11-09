@@ -47,7 +47,7 @@ SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 
 def _load_settings() -> dict:
     data = {
-        "repo_path": os.path.expanduser("~/dots-hyprland"),
+        "repo_path": "",
         "auto_refresh_seconds": 60,
         "detached_console": False,  # run installer in separate window
         "installer_mode": "files-only",  # "files-only" or "full"
@@ -86,8 +86,22 @@ def _save_settings(data: dict) -> None:
 
 
 SETTINGS = _load_settings()
-# Ensure repo path is always a string; fallback to default if missing or None
-REPO_PATH = str(SETTINGS.get("repo_path") or os.path.expanduser("~/dots-hyprland"))
+
+
+def _detect_initial_repo_path() -> str:
+    p = str(SETTINGS.get("repo_path") or "").strip()
+    if p and os.path.isdir(p):
+        return p
+    fallback = os.path.expanduser("~/.cache/dots-hyprland")
+    if os.path.isdir(fallback):
+        # Persist fallback so future runs are consistent
+        SETTINGS["repo_path"] = fallback
+        _save_settings(SETTINGS)
+        return fallback
+    return ""
+
+
+REPO_PATH = _detect_initial_repo_path()
 AUTO_REFRESH_SECONDS = int(SETTINGS.get("auto_refresh_seconds", 60))
 
 
@@ -1399,9 +1413,7 @@ polkit.addRule(function(action, subject) {{
             # removed: polkit_agent_cmd (no longer used)
             _save_settings(SETTINGS)
 
-            REPO_PATH = str(
-                SETTINGS.get("repo_path") or os.path.expanduser("~/dots-hyprland")
-            )
+            REPO_PATH = str(SETTINGS.get("repo_path") or "")
             AUTO_REFRESH_SECONDS = int(
                 SETTINGS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS)
             )
@@ -2112,9 +2124,7 @@ class SetupConsole(Gtk.Window):
             _save_settings(SETTINGS)
             # Update globals used elsewhere
 
-            REPO_PATH = str(
-                SETTINGS.get("repo_path") or os.path.expanduser("~/dots-hyprland")
-            )
+            REPO_PATH = str(SETTINGS.get("repo_path") or "")
             AUTO_REFRESH_SECONDS = int(
                 SETTINGS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS)
             )
@@ -3078,6 +3088,35 @@ class App(Gtk.Application):
         super().__init__(application_id=APP_ID)
 
     def do_activate(self) -> None:  # type: ignore[override]
+        global REPO_PATH
+        # First-run selection if no repo path configured and no fallback found
+        if not REPO_PATH or not os.path.isdir(REPO_PATH):
+            chooser = Gtk.FileChooserDialog(
+                title="Select repository directory",
+                transient_for=None,
+                action=Gtk.FileChooserAction.SELECT_FOLDER,
+            )
+            chooser.add_buttons(
+                "Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK
+            )
+            try:
+                start_dir = os.path.expanduser("~")
+                if os.path.isdir(start_dir):
+                    chooser.set_current_folder(start_dir)
+            except Exception:
+                pass
+            resp = chooser.run()
+            if resp == Gtk.ResponseType.OK:
+                chosen = chooser.get_filename()
+                if chosen and os.path.isdir(chosen):
+                    SETTINGS["repo_path"] = chosen
+                    _save_settings(SETTINGS)
+                    REPO_PATH = chosen
+            chooser.destroy()
+            # If user canceled and we still don't have a valid path, do not open main window
+            if not REPO_PATH or not os.path.isdir(REPO_PATH):
+                return
+
         if not self.props.active_window:
             MainWindow(self)
         self.props.active_window.present()
