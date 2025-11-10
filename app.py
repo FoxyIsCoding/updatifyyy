@@ -38,11 +38,23 @@ from gi.repository import (
     Pango,  # noqa: E402  # type: ignore
 )
 
-APP_ID = "com.foxy.illogical-updots"
+APP_ID = "com.example.illogical-updots"
 APP_TITLE = "illogical-updots"
 # Settings (persisted)
 SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "illogical-updots")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
+
+
+def _get_app_icon_path() -> str:
+    """
+    Return absolute path to the app icon within the repository, if available.
+    """
+    try:
+        here = os.path.dirname(__file__)
+        p = os.path.join(here, ".github", "assets", "logo.png")
+        return p if os.path.isfile(p) else ""
+    except Exception:
+        return ""
 
 
 def _load_settings() -> dict:
@@ -227,6 +239,13 @@ class MainWindow(Gtk.ApplicationWindow):
         self.header_bar = hb
         self.header_bar.props.subtitle = REPO_PATH
         self.set_titlebar(hb)
+        # Try to set window icon from assets
+        try:
+            icon_path = _get_app_icon_path()
+            if icon_path:
+                self.set_icon_from_file(icon_path)
+        except Exception:
+            pass
 
         # Refresh button on the left (start)
         self.refresh_btn = Gtk.Button.new_from_icon_name(
@@ -3116,6 +3135,13 @@ def launch_install_external(repo_path: str) -> None:
 class App(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
+        # Set default icon for all windows
+        try:
+            ip = _get_app_icon_path()
+            if ip:
+                Gtk.Window.set_default_icon_from_file(ip)
+        except Exception:
+            pass
 
     def do_activate(self) -> None:  # type: ignore[override]
         global REPO_PATH
