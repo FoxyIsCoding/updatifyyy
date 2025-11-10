@@ -36,17 +36,16 @@
   - **Silent Update Notifications** - Background extension that will run on start and check once in a time for update and if found notify you
   - **Build Appimage file** - Add appimage release so it will be able to be installed as an app
 </details>
-<details> 
+
   <summary>Installation</summary>
   
-   - Current installation script is one time run so you dont have to even install anything which is neat. In future you will be able to install this as an app that will be in your app drawer too.
-   - Just run `curl -sL https://raw.githubusercontent.com/FoxyIsCoding/illogical-updots/main/app.py | python
+   - Current installation script  will clone the app into ~/.cache/illogical-updots and make a .desktop entry. if you dont want to install the app you can clone the repo and run app.py
+   - Just run `curl -sSL https://github.com/FoxyIsCoding/illogical-updots/raw/refs/heads/main/install.sh | bash
 `
      - Or, clone this repo and run `app.py`
 
-In future there will be an appimage and a .desktop app ready..
 
-</details>
+
 
 <div align="center">
     <h2>• screenshots •</h2>
