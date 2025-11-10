@@ -38,7 +38,7 @@ from gi.repository import (
     Pango,  # noqa: E402  # type: ignore
 )
 
-APP_ID = "com.example.illogical-updots"
+APP_ID = "com.foxy.illogical-updots"
 APP_TITLE = "illogical-updots"
 # Settings (persisted)
 SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "illogical-updots")
@@ -814,7 +814,10 @@ polkit.addRule(function(action, subject) {{
             try:
                 with open(rule_path, "r", encoding="utf-8") as f:
                     existing = f.read()
-                if "illogical-updots persistent auth rule" in existing and user in existing:
+                if (
+                    "illogical-updots persistent auth rule" in existing
+                    and user in existing
+                ):
                     need_write = False
             except Exception:
                 need_write = True
@@ -1472,7 +1475,6 @@ polkit.addRule(function(action, subject) {{
                     [
                         "git",
                         "stash",
-
                         "push",
                         "--include-untracked",
                         "-m",
@@ -3092,6 +3094,25 @@ class App(Gtk.Application):
         global REPO_PATH
         # First-run selection if no repo path configured and no fallback found
         if not REPO_PATH or not os.path.isdir(REPO_PATH):
+            # Explain the situation and ask user to continue to select a repository
+            alert = Gtk.MessageDialog(
+                transient_for=None,
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Repository not found",
+            )
+            alert.format_secondary_text(
+                "No repository path is configured, and no default could be detected.\n"
+                "Please select your repository folder to continue."
+            )
+            alert.add_button("Cancel", Gtk.ResponseType.CANCEL)
+            alert.add_button("Continue", Gtk.ResponseType.OK)
+            resp_alert = alert.run()
+            alert.destroy()
+            if resp_alert != Gtk.ResponseType.OK:
+                return
+            # Open file chooser after user confirms
             chooser = Gtk.FileChooserDialog(
                 title="Select repository directory",
                 transient_for=None,
