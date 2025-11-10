@@ -1192,7 +1192,16 @@ polkit.addRule(function(action, subject) {{
         show_details_dialog(self, "Update Logs", brief_body, expanded)
 
     def _show_settings_dialog(self) -> None:
+        """
+        Clean single-page settings dialog with visual section headers using a ListBox.
+        Categories:
+          GENERAL
+          CONSOLE
+          VIEW
+          POST ACTIONS
+        """
         global REPO_PATH, AUTO_REFRESH_SECONDS
+
         dialog = Gtk.Dialog(
             title="Settings",
             transient_for=self,
@@ -1201,28 +1210,63 @@ polkit.addRule(function(action, subject) {{
         dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
         dialog.add_button("Save", Gtk.ResponseType.OK)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_border_width(12)
         content = dialog.get_content_area()
-        content.add(box)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_border_width(18)
+        content.add(outer)
 
-        # Repo path row
-        repo_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl_repo = Gtk.Label(label="Repository path:")
-        lbl_repo.set_xalign(0.0)
-        repo_row.pack_start(lbl_repo, False, False, 0)
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        outer.pack_start(listbox, True, True, 0)
+
+        def section(title: str) -> Gtk.Widget:
+            # Deprecated header function (kept for backward compatibility if called elsewhere)
+            lbl = Gtk.Label(label=title)
+            lbl.set_xalign(0.0)
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            box.pack_start(lbl, False, False, 0)
+            row.add(box)
+            listbox.add(row)
+            return box
+
+        def separator() -> None:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            box.set_border_width(10)
+            sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            box.pack_start(sep, False, False, 0)
+            row.add(box)
+            listbox.add(row)
+
+        def setting(label: str, widget: Gtk.Widget, tooltip: str = "") -> None:
+            row = Gtk.ListBoxRow()
+            h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            h.set_border_width(6)
+            lbl = Gtk.Label(label=label)
+            lbl.set_xalign(0.0)
+            lbl.set_width_chars(26)
+            if tooltip:
+                lbl.set_tooltip_text(tooltip)
+                widget.set_tooltip_text(tooltip)
+            h.pack_start(lbl, False, False, 0)
+            h.pack_start(widget, True, True, 0)
+            row.add(h)
+            listbox.add(row)
+
+        # GENERAL
 
         entry_repo = Gtk.Entry()
-        entry_repo.set_hexpand(True)
         entry_repo.set_text(SETTINGS.get("repo_path", REPO_PATH) or "")
-        repo_row.pack_start(entry_repo, True, True, 0)
-
-        browse_btn = Gtk.Button.new_from_icon_name(
+        btn_repo = Gtk.Button.new_from_icon_name(
             "folder-open-symbolic", Gtk.IconSize.BUTTON
         )
-        browse_btn.set_tooltip_text("Browse for repository folder")
 
-        def on_browse(_btn):
+        repo_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        repo_container.pack_start(entry_repo, True, True, 0)
+        repo_container.pack_start(btn_repo, False, False, 0)
+
+        def browse_repo(_b):
             chooser = Gtk.FileChooserDialog(
                 title="Select repository directory",
                 transient_for=self,
@@ -1239,44 +1283,25 @@ polkit.addRule(function(action, subject) {{
                 pass
             resp = chooser.run()
             if resp == Gtk.ResponseType.OK:
-                filename = chooser.get_filename()
-                if filename:
-                    entry_repo.set_text(filename)
+                chosen = chooser.get_filename()
+                if chosen:
+                    entry_repo.set_text(chosen)
             chooser.destroy()
 
-        browse_btn.connect("clicked", on_browse)
-        repo_row.pack_start(browse_btn, False, False, 0)
-        box.pack_start(repo_row, False, False, 0)
-
-        # Auto refresh interval row
-        refresh_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl_ref = Gtk.Label(label="Auto refresh (s):")
-        lbl_ref.set_xalign(0.0)
-        refresh_row.pack_start(lbl_ref, False, False, 0)
+        btn_repo.connect("clicked", browse_repo)
+        setting("Repository path", repo_container, "Folder containing your git repo")
 
         entry_refresh = Gtk.Entry()
         entry_refresh.set_width_chars(6)
         entry_refresh.set_text(
             str(SETTINGS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS))
         )
-        refresh_row.pack_start(entry_refresh, False, False, 0)
-        box.pack_start(refresh_row, False, False, 0)
-
-        # Detached console toggle
-        console_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        cb_detached = Gtk.CheckButton.new_with_label("Use detached installer console")
-        cb_detached.set_active(bool(SETTINGS.get("detached_console", False)))
-        cb_detached.set_tooltip_text(
-            "If enabled, installer runs in a separate window with its own interactive console."
+        setting(
+            "Auto refresh (seconds)",
+            entry_refresh,
+            "Interval between automatic repository status checks",
         )
-        console_row.pack_start(cb_detached, False, False, 0)
-        box.pack_start(console_row, False, False, 0)
 
-        # Installer mode
-        mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl_mode = Gtk.Label(label="Installer mode:")
-        lbl_mode.set_xalign(0.0)
-        mode_row.pack_start(lbl_mode, False, False, 0)
         cmb_mode = Gtk.ComboBoxText()
         cmb_mode.append_text("files-only")
         cmb_mode.append_text("full")
@@ -1284,71 +1309,55 @@ polkit.addRule(function(action, subject) {{
         if current_mode not in ("files-only", "full"):
             current_mode = "files-only"
         cmb_mode.set_active(0 if current_mode == "files-only" else 1)
-        mode_row.pack_start(cmb_mode, False, False, 0)
-        box.pack_start(mode_row, False, False, 0)
+        setting("Installer mode", cmb_mode, "Which setup subcommand to run")
 
-        # Console options
-        console_opts = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        cb_pty = Gtk.CheckButton.new_with_label("Embedded console: use PTY")
+        cb_detached = Gtk.CheckButton.new_with_label("Run installer in separate window")
+        cb_detached.set_active(bool(SETTINGS.get("detached_console", False)))
+        setting("Detached installer console", cb_detached)
+
+        # CONSOLE (separator)
+        separator()
+        cb_pty = Gtk.CheckButton.new_with_label("Allocate PTY for embedded process")
         cb_pty.set_active(bool(SETTINGS.get("use_pty", True)))
-        console_opts.pack_start(cb_pty, False, False, 0)
+        setting("Use PTY", cb_pty)
 
-        cb_color = Gtk.CheckButton.new_with_label("Force color environment")
+        cb_color = Gtk.CheckButton.new_with_label("Force color environment variables")
         cb_color.set_active(bool(SETTINGS.get("force_color_env", True)))
-        cb_color.set_tooltip_text(
-            "Sets TERM/CLICOLOR/CLICOLOR_FORCE for colorized output"
-        )
-        console_opts.pack_start(cb_color, False, False, 0)
+        setting("Force color env", cb_color, "Sets TERM/CLICOLOR/CLICOLOR_FORCE")
 
-        cb_notify = Gtk.CheckButton.new_with_label("Send notifications")
+        cb_notify = Gtk.CheckButton.new_with_label("Show desktop notifications")
         cb_notify.set_active(bool(SETTINGS.get("send_notifications", True)))
-        console_opts.pack_start(cb_notify, False, False, 0)
-        box.pack_start(console_opts, False, False, 0)
+        setting("Notifications", cb_notify)
 
-        # Log options
-        log_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl_log = Gtk.Label(label="Max log lines (0=unlimited):")
-        lbl_log.set_xalign(0.0)
-        log_row.pack_start(lbl_log, False, False, 0)
         spin_log = Gtk.SpinButton()
         spin_log.set_range(0, 100000)
         spin_log.set_increments(100, 1000)
         spin_log.set_value(float(int(SETTINGS.get("log_max_lines", 5000))))
-        log_row.pack_start(spin_log, False, False, 0)
-        box.pack_start(log_row, False, False, 0)
+        setting("Max log lines (0 = unlimited)", spin_log)
 
-        # Changes view options
-        changes_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        cb_lazy = Gtk.CheckButton.new_with_label("Lazy load commits with animations")
+        # VIEW (separator)
+        separator()
+        cb_lazy = Gtk.CheckButton.new_with_label("Animate & lazy-load commit rows")
         cb_lazy.set_active(bool(SETTINGS.get("changes_lazy_load", True)))
-        changes_row.pack_start(cb_lazy, False, False, 0)
-        box.pack_start(changes_row, False, False, 0)
+        setting("Lazy load commits", cb_lazy)
 
-        # Show 'Details…' button under banner
-        details_btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        cb_details_btn = Gtk.CheckButton.new_with_label(
-            "Show 'Details…' button under banner"
-        )
+        cb_details_btn = Gtk.CheckButton.new_with_label("Show banner 'Details…' button")
         cb_details_btn.set_active(bool(SETTINGS.get("show_details_button", True)))
-        details_btn_row.pack_start(cb_details_btn, False, False, 0)
-        box.pack_start(details_btn_row, False, False, 0)
+        setting("Banner details button", cb_details_btn)
 
-        # Post-install script
-        post_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        lbl_post = Gtk.Label(label="Post-install script:")
-        lbl_post.set_xalign(0.0)
-        post_row.pack_start(lbl_post, False, False, 0)
+        # POST ACTIONS (separator)
+        separator()
         entry_post = Gtk.Entry()
-        entry_post.set_hexpand(True)
-        entry_post.set_placeholder_text("/path/to/script.sh")
         entry_post.set_text(str(SETTINGS.get("post_script_path", "") or ""))
-        post_row.pack_start(entry_post, True, True, 0)
-        browse_post = Gtk.Button.new_from_icon_name(
+        entry_post.set_placeholder_text("/path/to/script.sh")
+        btn_post = Gtk.Button.new_from_icon_name(
             "folder-open-symbolic", Gtk.IconSize.BUTTON
         )
-        browse_post.set_tooltip_text("Browse for post-install script")
+        post_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        post_container.pack_start(entry_post, True, True, 0)
+        post_container.pack_start(btn_post, False, False, 0)
 
-        def on_browse_post(_btn):
+        def browse_post(_b):
             chooser = Gtk.FileChooserDialog(
                 title="Select script",
                 transient_for=self,
@@ -1365,21 +1374,20 @@ polkit.addRule(function(action, subject) {{
                     chooser.set_current_folder(start_dir)
             except Exception:
                 pass
-            resp2 = chooser.run()
-            if resp2 == Gtk.ResponseType.OK:
-                filename = chooser.get_filename()
-                if filename:
-                    entry_post.set_text(filename)
+            resp = chooser.run()
+            if resp == Gtk.ResponseType.OK:
+                chosen = chooser.get_filename()
+                if chosen:
+                    entry_post.set_text(chosen)
             chooser.destroy()
 
-        browse_post.connect("clicked", on_browse_post)
-        post_row.pack_start(browse_post, False, False, 0)
-        box.pack_start(post_row, False, False, 0)
+        btn_post.connect("clicked", browse_post)
+        setting("Post-install script", post_container, "Script run after installer")
 
         dialog.show_all()
         resp = dialog.run()
         if resp == Gtk.ResponseType.OK:
-            new_repo = entry_repo.get_text().strip()
+            # Refresh interval
             new_refresh_raw = entry_refresh.get_text().strip()
             try:
                 new_refresh = int(new_refresh_raw)
@@ -1387,18 +1395,18 @@ polkit.addRule(function(action, subject) {{
                     raise ValueError
             except ValueError:
                 new_refresh = AUTO_REFRESH_SECONDS
-
+            # Repo path
+            new_repo = entry_repo.get_text().strip()
             if new_repo and os.path.isdir(new_repo):
                 SETTINGS["repo_path"] = new_repo
             else:
                 self._show_message(
                     Gtk.MessageType.WARNING,
-                    "Invalid repo path (must be an existing directory). Keeping previous.",
+                    "Invalid repo path (must exist). Keeping previous.",
                 )
-
+            # Persist all settings
             SETTINGS["auto_refresh_seconds"] = new_refresh
             SETTINGS["detached_console"] = cb_detached.get_active()
-            # Advanced settings
             SETTINGS["installer_mode"] = (
                 "files-only" if cmb_mode.get_active() == 0 else "full"
             )
@@ -1412,16 +1420,11 @@ polkit.addRule(function(action, subject) {{
             SETTINGS["changes_lazy_load"] = cb_lazy.get_active()
             SETTINGS["show_details_button"] = cb_details_btn.get_active()
             SETTINGS["post_script_path"] = entry_post.get_text().strip()
-            # removed: ensure_polkit_agent (no longer used)
-            # removed: polkit_agent_cmd (no longer used)
             _save_settings(SETTINGS)
-
             REPO_PATH = str(SETTINGS.get("repo_path") or "")
             AUTO_REFRESH_SECONDS = int(
                 SETTINGS.get("auto_refresh_seconds", AUTO_REFRESH_SECONDS)
             )
-
-            # Refresh now to reflect new path
             if hasattr(self, "header_bar"):
                 try:
                     self.header_bar.props.subtitle = REPO_PATH
