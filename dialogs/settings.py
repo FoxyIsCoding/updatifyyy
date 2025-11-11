@@ -1,11 +1,14 @@
 import os
+
 import gi
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk
 
 
-def show_settings_dialog(window, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _save_settings) -> None:
+def show_settings_dialog(
+    window, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _save_settings
+) -> None:
     """
     Clean single-page settings dialog with visual section headers using a ListBox.
     Categories:
@@ -107,10 +110,11 @@ def show_settings_dialog(window, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _sav
     cmb_mode = Gtk.ComboBoxText()
     cmb_mode.append_text("files-only")
     cmb_mode.append_text("full")
+    cmb_mode.append_text("auto")
     current_mode = str(SETTINGS.get("installer_mode", "files-only"))
-    if current_mode not in ("files-only", "full"):
+    if current_mode not in ("files-only", "full", "auto"):
         current_mode = "files-only"
-    cmb_mode.set_active(0 if current_mode == "files-only" else 1)
+    cmb_mode.set_active({"files-only": 0, "full": 1, "auto": 2}[current_mode])
     setting("Installer mode", cmb_mode, "Which setup subcommand to run")
 
     cb_detached = Gtk.CheckButton.new_with_label("Run installer in separate window")
@@ -209,8 +213,8 @@ def show_settings_dialog(window, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _sav
         # Persist all settings
         SETTINGS["auto_refresh_seconds"] = new_refresh
         SETTINGS["detached_console"] = cb_detached.get_active()
-        SETTINGS["installer_mode"] = (
-            "files-only" if cmb_mode.get_active() == 0 else "full"
+        SETTINGS["installer_mode"] = {0: "files-only", 1: "full", 2: "auto"}.get(
+            cmb_mode.get_active(), "files-only"
         )
         SETTINGS["use_pty"] = cb_pty.get_active()
         SETTINGS["force_color_env"] = cb_color.get_active()

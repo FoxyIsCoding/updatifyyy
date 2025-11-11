@@ -57,7 +57,7 @@ def _load_settings() -> dict:
         "repo_path": "",
         "auto_refresh_seconds": 60,
         "detached_console": False,  # run installer in separate window
-        "installer_mode": "files-only",  # "files-only" or "full"
+        "installer_mode": "files-only",  # "files-only", "full", or "auto"
         "use_pty": True,  # PTY for embedded console
         "force_color_env": True,  # force TERM/CLICOLOR env for color
         "send_notifications": True,  # desktop notifications on finish
@@ -263,10 +263,6 @@ class MainWindow(Gtk.ApplicationWindow):
         mi_logs = Gtk.MenuItem(label="Git Logs")
         mi_logs.connect("activate", self.on_logs_clicked)
         menu.append(mi_logs)
-
-        mi_fonts = Gtk.MenuItem(label="Install Nerd Fonts")
-        mi_fonts.connect("activate", self.on_install_nerd_fonts_clicked)
-        menu.append(mi_fonts)
 
         mi_about = Gtk.MenuItem(label="About")
         mi_about.connect("activate", self.on_about_clicked)
@@ -684,121 +680,6 @@ class MainWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _show_nerd_fonts_dialog(self) -> None:
-        """
-        Simple dialog to choose Nerd Fonts to install.
-        Installation runs via background thread; updates appear in log panel.
-        """
-        fonts = [
-            ("JetBrainsMono", "JetBrainsMono"),
-            ("FiraCode", "FiraCode"),
-            ("Hack", "Hack"),
-            ("CascadiaCode", "CascadiaCode"),
-            ("Iosevka", "Iosevka"),
-            ("Mononoki", "Mononoki"),
-            ("Meslo", "MesloLGS NF"),
-            ("Symbols Nerd", "SymbolsNerdFont"),
-            ("Noto Emoji", "NotoColorEmoji"),
-        ]
-        dialog = Gtk.Dialog(
-            title="Install Nerd Fonts",
-            transient_for=self,
-            flags=0,
-        )
-        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Install", Gtk.ResponseType.OK)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_border_width(12)
-        dialog.get_content_area().add(box)
-        info = Gtk.Label(
-            label="Select fonts to install (downloads to ~/.local/share/fonts/NerdFonts).\nRequires network and write permissions."
-        )
-        info.set_xalign(0.0)
-        box.pack_start(info, False, False, 0)
-        checks: list[tuple[Gtk.CheckButton, str]] = []
-        for label, key in fonts:
-            cb = Gtk.CheckButton.new_with_label(label)
-            cb.set_active(label in ("JetBrainsMono", "Symbols Nerd"))
-            box.pack_start(cb, False, False, 0)
-            checks.append((cb, key))
-        dialog.show_all()
-        resp = dialog.run()
-        if resp != Gtk.ResponseType.OK:
-            dialog.destroy()
-            return
-        selected = [k for cb, k in checks if cb.get_active()]
-        dialog.destroy()
-        if not selected:
-            self._show_message(Gtk.MessageType.INFO, "No fonts selected.")
-            return
-        lr = getattr(self, "log_revealer", None)
-        if lr:
-            lr.set_reveal_child(True)
-        self._append_log("\n=== NERD FONTS INSTALL ===\n")
-        self._busy(True, "Installing fonts...")
-
-        def install_fonts():
-            success = True
-            target_dir = os.path.expanduser("~/.local/share/fonts/NerdFonts")
-            try:
-                os.makedirs(target_dir, exist_ok=True)
-            except Exception as ex:
-                self._append_log(f"[error] mkdir fonts: {ex}\n")
-                success = False
-            base_url = (
-                "https://github.com/ryanoasis/nerd-fonts/releases/latest/download"
-            )
-            for font in selected:
-                archive = f"{font}.tar.xz"
-                url = f"{base_url}/{archive}"
-                self._append_log(f"Downloading {archive}...\n")
-                try:
-                    import urllib.request
-
-                    data = urllib.request.urlopen(url, timeout=30).read()
-                    tmp = os.path.join(target_dir, archive)
-                    with open(tmp, "wb") as f:
-                        f.write(data)
-                    import tarfile
-
-                    self._append_log(f"Extracting {archive}...\n")
-                    with tarfile.open(tmp, "r:xz") as tf:
-                        tf.extractall(path=target_dir)
-                    os.remove(tmp)
-                except Exception as ex:
-                    self._append_log(f"[error] {font}: {ex}\n")
-                    success = False
-            if success:
-                self._append_log("Updating font cache...\n")
-                try:
-                    subprocess.run(
-                        ["fc-cache", "-f", "-v"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    pass
-
-            def done():
-                self._busy(False, "")
-                self._add_log(
-                    "Nerd Fonts Install",
-                    "Fonts installation complete"
-                    if success
-                    else "Fonts installation had errors",
-                    ", ".join(selected),
-                )
-                self._show_message(
-                    Gtk.MessageType.INFO,
-                    "Nerd Fonts installed. Restart applications to use them."
-                    if success
-                    else "Some fonts failed to install. Check log.",
-                )
-
-            GLib.idle_add(done)
-
-        threading.Thread(target=install_fonts, daemon=True).start()
-
     def _ensure_polkit_keep_auth(self) -> None:
         """
         Install a polkit rules file to allow cached admin authentication (AUTH_ADMIN_KEEP)
@@ -853,12 +734,17 @@ polkit.addRule(function(action, subject) {{
 
     def _plan_install_commands(self) -> list[list[str]]:
         """
-        Simplified plan: always run files-only install.
+        Plan installer commands based on installer_mode.
+        In 'auto' we default to files-only here; possible full install handled earlier.
         """
         mode = str(SETTINGS.get("installer_mode", "files-only"))
         if mode == "full":
             self._append_log("Installer mode: full install.\n")
             return [["./setup", "install"]]
+        if mode == "auto":
+            self._append_log("Installer mode: auto (pending decision).\n")
+            # Decision for full vs files-only is made in on_update_clicked
+            return [["./setup", "install-files"]]
         self._append_log("Installer mode: files-only.\n")
         return [["./setup", "install-files"]]
 
@@ -991,8 +877,80 @@ polkit.addRule(function(action, subject) {{
 
         return ok
 
-    def on_install_nerd_fonts_clicked(self, _item):
-        self._show_nerd_fonts_dialog()
+    def _ensure_tray_icon(self):
+        if getattr(self, "_tray_icon", None):
+            return
+        try:
+            icon = Gtk.StatusIcon.new_from_icon_name("system-software-update")
+            icon.set_tooltip_text(APP_TITLE)
+            icon.connect("activate", lambda _i: self._restore_from_tray())
+            self._tray_icon = icon
+        except Exception:
+            pass
+
+    def _restore_from_tray(self):
+        try:
+            self.show_all()
+            if getattr(self, "_tray_icon", None):
+                self._tray_icon.set_visible(False)
+        except Exception:
+            pass
+
+    def _auto_mode_decide_full(self, repo_path: str) -> bool:
+        """
+        In 'auto' mode, detect INCOMING changes from upstream within sdata/dist-arch.
+        If such changes are detected, prompt for FULL installation in external terminal.
+        Returns True if user chooses full install, False for files-only.
+        """
+        # Determine upstream ref
+        upstream = None
+        try:
+            st = getattr(self, "_status", None)
+            branch = st.branch if st and st.branch else get_branch(repo_path)
+            upstream = (
+                st.upstream if st and st.upstream else get_upstream(repo_path, branch)
+            )
+        except Exception:
+            upstream = None
+        # Fetch to ensure we compare against the latest upstream
+        try:
+            run_git(["fetch", "--all", "--prune"], repo_path)
+        except Exception:
+            pass
+        # Check for incoming changes in sdata/dist-arch from upstream
+        changed = False
+        if upstream:
+            for rel in ["sdata", "dist-arch"]:
+                rc, out, _ = run_git(
+                    ["diff", "--name-only", f"HEAD..{upstream}", "--", rel], repo_path
+                )
+                if rc == 0 and any(line.strip() for line in out.splitlines()):
+                    changed = True
+                    break
+        # Fallback: if upstream unknown, check local modified/untracked as a best-effort
+        if not changed and not upstream:
+            for rel in ["sdata", "dist-arch"]:
+                rc, out, _ = run_git(["status", "--porcelain", "--", rel], repo_path)
+                if rc == 0 and any(line.strip() for line in out.splitlines()):
+                    changed = True
+                    break
+        if not changed:
+            return False
+        dlg = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text="Package-related changes detected",
+        )
+        dlg.format_secondary_text(
+            "Incoming changes found in sdata/dist-arch.\nRun FULL installation for package changes?\n\nYes = full (./setup --install)\nNo = minimal (./setup --install-files)"
+        )
+        dlg.add_button("No (files-only)", Gtk.ResponseType.NO)
+        dlg.add_button("Yes (full)", Gtk.ResponseType.YES)
+        resp = dlg.run()
+        dlg.destroy()
+        return resp == Gtk.ResponseType.YES
 
     def _run_update_without_pull(self) -> None:
         # Route to the same update flow as the Update button for consistency
@@ -1195,6 +1153,12 @@ polkit.addRule(function(action, subject) {{
             return
         repo_path = self._status.repo_path
 
+        # Auto mode decision before any git update (prompt now, use choice after pull)
+        mode = str(SETTINGS.get("installer_mode", "files-only"))
+        if mode == "auto":
+            full = self._auto_mode_decide_full(repo_path)
+            self._auto_mode_choice = "full" if full else "files-only"
+
         # Pre-check for unresolved conflicts/rebase in progress
         if not self._check_and_handle_unmerged_conflicts(repo_path):
             # User canceled or abort failed; do not proceed
@@ -1274,10 +1238,78 @@ polkit.addRule(function(action, subject) {{
                     text=True,
                 )
 
+            # After pull, in 'auto' mode use the pre-decided choice (external kitty for full, or files-only)
+            mode = str(SETTINGS.get("installer_mode", "files-only"))
+            if mode == "auto":
+                full = getattr(self, "_auto_mode_choice", "files-only") == "full"
+                self._auto_mode_choice = None
+                if full:
+                    # Prefer external kitty for full install and hide to tray until done
+                    if shutil.which("kitty") is not None:
+                        # Show tray and hide window on UI thread
+                        def _prep_tray():
+                            self._ensure_tray_icon()
+                            try:
+                                if getattr(self, "_tray_icon", None):
+                                    self._tray_icon.set_visible(True)
+                            except Exception:
+                                pass
+                            try:
+                                self.hide()
+                            except Exception:
+                                pass
+                            # Clear busy state before handing off to external terminal
+                            self._busy(False, "")
+                            return False
+
+                        GLib.idle_add(_prep_tray)
+
+                        def _kitty_work2():
+                            try:
+                                subprocess.Popen(
+                                    [
+                                        "kitty",
+                                        "-e",
+                                        "bash",
+                                        "-lc",
+                                        f"cd {shlex.quote(repo_path)} && ./setup install",
+                                    ]
+                                ).wait()
+                            except Exception as ex:
+                                msg = f"Failed to launch kitty: {ex}"
+                                GLib.idle_add(
+                                    lambda: (
+                                        self._show_message(
+                                            Gtk.MessageType.ERROR,
+                                            msg,
+                                        ),
+                                        False,
+                                    )
+                                )
+                            finally:
+                                GLib.idle_add(
+                                    lambda: (
+                                        self._restore_from_tray(),
+                                        self.refresh_status(),
+                                        False,
+                                    )
+                                )
+
+                        threading.Thread(target=_kitty_work2, daemon=True).start()
+                        return
+                    else:
+                        # kitty missing; fall back to embedded full installer
+                        plan_cmds = [["./setup", "install"]]
+                else:
+                    # No package changes or user declined full; proceed with files-only in embedded console
+                    plan_cmds = [["./setup", "install-files"]]
             # If installer exists, stream its output into the embedded log with PTY/colors
             setup_path = os.path.join(repo_path, "setup")
             if os.path.isfile(setup_path) and os.access(setup_path, os.X_OK):
                 self._append_log("Running installer...\n")
+                if "plan_cmds" not in locals() or not plan_cmds:
+                    # Fallback: ensure plan_cmds is defined (auto mode may have set it later)
+                    plan_cmds = self._plan_install_commands()
                 extra_args = plan_cmds[0][1:]
                 try:
                     p = _spawn_setup_install(
