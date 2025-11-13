@@ -227,6 +227,51 @@ class MainWindow(Gtk.ApplicationWindow):
         self.set_default_size(520, 280)
         self.set_border_width(0)
 
+        # Set icon by name (theme/desktop file) and build a multi-size icon list for WMs
+        try:
+            self.set_icon_name("illogical-updots")
+        except Exception:
+            pass
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                "/usr/share/icons/hicolor/256x256/apps/illogical-updots.png",
+                "/usr/share/icons/hicolor/128x128/apps/illogical-updots.png",
+                "/usr/share/icons/hicolor/64x64/apps/illogical-updots.png",
+                "/usr/share/icons/hicolor/48x48/apps/illogical-updots.png",
+                "/usr/share/icons/hicolor/32x32/apps/illogical-updots.png",
+                "/usr/share/icons/hicolor/16x16/apps/illogical-updots.png",
+                "/usr/share/pixmaps/illogical-updots.png",
+                os.path.join(base_dir, ".github", "assets", "logo.png"),
+                os.path.join(base_dir, "assets", "logo.png"),
+            ]
+            src = None
+            for p in candidates:
+                if os.path.isfile(p):
+                    src = p
+                    break
+            if src:
+                try:
+                    pixbuf = GdkPixbuf.Pixbuf.new_from_file(src)
+                    sizes = [16, 24, 32, 48, 64, 96, 128, 256]
+                    icon_list = []
+                    for s in sizes:
+                        try:
+                            icon_list.append(
+                                pixbuf.scale_simple(s, s, GdkPixbuf.InterpType.BILINEAR)
+                            )
+                        except Exception:
+                            continue
+                    if icon_list:
+                        self.set_icon_list(icon_list)
+                except Exception:
+                    try:
+                        self.set_icon_from_file(src)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         # HeaderBar
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
@@ -881,7 +926,7 @@ polkit.addRule(function(action, subject) {{
         if getattr(self, "_tray_icon", None):
             return
         try:
-            icon = Gtk.StatusIcon.new_from_icon_name("system-software-update")
+            icon = Gtk.StatusIcon.new_from_icon_name("illogical-updots")
             icon.set_tooltip_text(APP_TITLE)
             icon.connect("activate", lambda _i: self._restore_from_tray())
             self._tray_icon = icon

@@ -13,9 +13,17 @@ Requirements:
 - git installed and available on PATH
 """
 
+import logging
 import os
 import sys
+import threading
+import urllib.request
 from typing import Optional
+
+LOG = logging.getLogger("illogical-updots")
+if not LOG.handlers:
+    level = logging.DEBUG if os.environ.get("UPDOTS_DEBUG") else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s")
 
 import gi
 
@@ -35,13 +43,71 @@ from main_window import (
 class App(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
-        Gtk.Window.set_default_icon_name("illogical-updots")
-        _icon_file = "/usr/share/icons/hicolor/256x256/apps/illogical-updots.png"
+        # Ensure the process and app names map to the desktop file for icon association
+        GLib.set_prgname("illogical-updots")
+        GLib.set_application_name("Illogical Updots")
+        # Use theme icon name first
+        try:
+            LOG.debug("Setting default icon name 'illogical-updots'")
+            Gtk.Window.set_default_icon_name("illogical-updots")
+            LOG.debug("Icon name set via theme lookup")
+        except Exception as e:
+            LOG.debug(f"Failed to set icon name via theme lookup: {e}")
+
+        def _try_set_icon_file(p: str) -> bool:
+            if p and os.path.isfile(p):
+                LOG.debug(f"Trying icon file: {p}")
+                try:
+                    Gtk.Window.set_default_icon_from_file(p)
+                    LOG.debug(f"Set default icon from file: {p}")
+                    return True
+                except Exception as e:
+                    LOG.debug(f"Failed to set icon from file: {p}: {e}")
+                    return False
+            else:
+                LOG.debug(f"Icon file not found: {p}")
+            return False
+
+        # Known system and local paths
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates = [
+            "/usr/share/icons/hicolor/256x256/apps/illogical-updots.png",
+            "/usr/share/icons/hicolor/scalable/apps/illogical-updots.svg",
+            "/usr/share/pixmaps/illogical-updots.png",
+            os.path.join(base_dir, ".github", "assets", "logo.png"),
+            os.path.join(base_dir, "assets", "logo.png"),
+        ]
+        LOG.debug(f"Icon candidates: {candidates}")
+        if not any(_try_set_icon_file(p) for p in candidates):
+            # Fallback: cached download to avoid repeated network hits
+            cache_dir = os.path.join(os.path.expanduser("~/.cache"), "illogical-updots")
+            cache_path = os.path.join(cache_dir, "icon.png")
+            LOG.debug(f"Checking cached icon at {cache_path}")
+            if not _try_set_icon_file(cache_path):
+
+                def _download_icon():
+                    try:
+                        os.makedirs(cache_dir, exist_ok=True)
+                        url = "https://github.com/FoxyIsCoding/illogical-updots/blob/main/.github/assets/logo.png?raw=true"
+                        LOG.debug(f"Downloading icon from {url} to {cache_path}")
+                        urllib.request.urlretrieve(url, cache_path)
+                        LOG.debug("Icon downloaded; scheduling set from cache")
+                        GLib.idle_add(lambda: _try_set_icon_file(cache_path))
+                    except Exception as e:
+                        LOG.debug(f"Icon download failed: {e}")
+
+                try:
+                    LOG.debug("Starting background thread to download icon")
+                    threading.Thread(target=_download_icon, daemon=True).start()
+                except Exception as e:
+                    LOG.debug(f"Failed to start icon download thread: {e}")
+        _icon_file = ".github/assets/logo.png"
         if os.path.isfile(_icon_file):
             try:
+                LOG.debug(f"Using local repo icon: {_icon_file}")
                 Gtk.Window.set_default_icon_from_file(_icon_file)
-            except Exception:
-                pass
+            except Exception as e:
+                LOG.debug(f"Failed to set local repo icon: {e}")
 
     def do_activate(self) -> None:  # type: ignore[override]
         global REPO_PATH
@@ -94,7 +160,19 @@ class App(Gtk.Application):
 
         if not self.props.active_window:
             MainWindow(self)
-        self.props.active_window.present()
+        win = self.props.active_window
+        if win:
+            # Help DEs map the window to the desktop file/icon
+            try:
+                win.set_icon_name("illogical-updots")
+            except Exception:
+                pass
+            try:
+                # X11-specific; ignored elsewhere
+                win.set_wmclass("illogical-updots", "Illogical Updots")
+            except Exception:
+                pass
+            win.present()
 
     def do_shutdown(self) -> None:  # type: ignore[override]
         # Stop sudo keepalive thread cleanly
