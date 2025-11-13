@@ -57,13 +57,13 @@ def _load_settings() -> dict:
         "repo_path": "",
         "auto_refresh_seconds": 60,
         "detached_console": False,  # run installer in separate window
-        "installer_mode": "files-only",  # "files-only", "full", or "auto"
+        "installer_mode": "auto",  # default changed to auto: can decide full vs files-only
         "use_pty": True,  # PTY for embedded console
         "force_color_env": True,  # force TERM/CLICOLOR env for color
         "send_notifications": True,  # desktop notifications on finish
         "log_max_lines": 5000,  # trim logs to this many lines (0 to disable)
         "changes_lazy_load": True,  # lazy load commits with animations
-        "post_script_path": "",  # bash script to run after installer (no root)
+        "post_script_path": "",  # fish script to run after installer (no root)
         "show_details_button": True,  # show 'Details…' button under banner
     }
     try:
@@ -616,7 +616,7 @@ class MainWindow(Gtk.ApplicationWindow):
             console = SetupConsole(self, title=title)
             console.present()
             console.run_process(
-                ["bash", "-lc", chained],
+                ["fish", "-lc", chained],
                 cwd=repo_path,
                 on_finished=lambda: (
                     self.refresh_status(),
@@ -664,7 +664,7 @@ class MainWindow(Gtk.ApplicationWindow):
                                 break
                             success = True
                         else:
-                            fallback_cmd = ["bash"] + cmd
+                            fallback_cmd = ["fish"] + cmd
                             self._append_log(f"[fallback] {' '.join(fallback_cmd)}\n")
                             env = dict(os.environ)
                             if bool(SETTINGS.get("force_color_env", True)):
@@ -762,14 +762,14 @@ polkit.addRule(function(action, subject) {{
             cmd = f"cat > {shlex.quote(rule_path)} <<'EOF'\n{rule_content}\nEOF\nchmod 644 {shlex.quote(rule_path)}"
             if shutil.which("pkexec"):
                 subprocess.run(
-                    ["pkexec", "bash", "-c", cmd],
+                    ["pkexec", "fish", "-c", cmd],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=10,
                 )
             else:
                 subprocess.run(
-                    ["sudo", "bash", "-c", cmd],
+                    ["sudo", "fish", "-c", cmd],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=10,
@@ -782,7 +782,7 @@ polkit.addRule(function(action, subject) {{
         Plan installer commands based on installer_mode.
         In 'auto' we default to files-only here; possible full install handled earlier.
         """
-        mode = str(SETTINGS.get("installer_mode", "files-only"))
+        mode = str(SETTINGS.get("installer_mode", "auto"))
         if mode == "full":
             self._append_log("Installer mode: full install.\n")
             return [["./setup", "install"]]
@@ -1199,7 +1199,7 @@ polkit.addRule(function(action, subject) {{
         repo_path = self._status.repo_path
 
         # Auto mode decision before any git update (prompt now, use choice after pull)
-        mode = str(SETTINGS.get("installer_mode", "files-only"))
+        mode = str(SETTINGS.get("installer_mode", "auto"))
         if mode == "auto":
             full = self._auto_mode_decide_full(repo_path)
             self._auto_mode_choice = "full" if full else "files-only"
@@ -1283,15 +1283,19 @@ polkit.addRule(function(action, subject) {{
                     text=True,
                 )
 
-            # After pull, in 'auto' mode use the pre-decided choice (external kitty for full, or files-only)
-            mode = str(SETTINGS.get("installer_mode", "files-only"))
+            # After pull, decide installer execution strategy (auto/full may use external kitty)
+            mode = str(SETTINGS.get("installer_mode", "auto"))
+            full = False
             if mode == "auto":
                 full = getattr(self, "_auto_mode_choice", "files-only") == "full"
                 self._auto_mode_choice = None
+            elif mode == "full":
+                full = True
+            if mode in ("auto", "full"):
                 if full:
                     # Prefer external kitty for full install and hide to tray until done
                     if shutil.which("kitty") is not None:
-                        # Show tray and hide window on UI thread
+
                         def _prep_tray():
                             self._ensure_tray_icon()
                             try:
@@ -1303,7 +1307,6 @@ polkit.addRule(function(action, subject) {{
                                 self.hide()
                             except Exception:
                                 pass
-                            # Clear busy state before handing off to external terminal
                             self._busy(False, "")
                             return False
 
@@ -1315,7 +1318,7 @@ polkit.addRule(function(action, subject) {{
                                     [
                                         "kitty",
                                         "-e",
-                                        "bash",
+                                        "fish",
                                         "-lc",
                                         f"cd {shlex.quote(repo_path)} && ./setup install",
                                     ]
@@ -1346,7 +1349,7 @@ polkit.addRule(function(action, subject) {{
                         # kitty missing; fall back to embedded full installer
                         plan_cmds = [["./setup", "install"]]
                 else:
-                    # No package changes or user declined full; proceed with files-only in embedded console
+                    # Proceed with files-only install in embedded console
                     plan_cmds = [["./setup", "install-files"]]
             # If installer exists, stream its output into the embedded log with PTY/colors
             setup_path = os.path.join(repo_path, "setup")
@@ -1466,13 +1469,13 @@ polkit.addRule(function(action, subject) {{
                 if os.access(path, os.X_OK):
                     cmd_str = f"exec {shlex.quote(path)}"
                 else:
-                    cmd_str = f"exec bash {shlex.quote(path)}"
+                    cmd_str = f"exec fish {shlex.quote(path)}"
                     self._append_log(
-                        "[post-script] script not executable; running via bash interpreter\n"
+                        "[post-script] script not executable; running via fish interpreter\n"
                     )
-                self._append_log(f"$ bash -lc {shlex.quote(cmd_str)}\n")
+                self._append_log(f"$ fish -lc {shlex.quote(cmd_str)}\n")
                 p = subprocess.Popen(
-                    ["bash", "-lc", cmd_str],
+                    ["fish", "-lc", cmd_str],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -1682,7 +1685,7 @@ def _spawn_setup_install(
     extra_args = extra_args or []
     base_cmds = [
         ["./setup"] + extra_args,
-        ["bash", "./setup"] + extra_args,
+        ["fish", "./setup"] + extra_args,
         ["sh", "./setup"] + extra_args,
     ]
 
