@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-GTK3 app that checks ~/dots-hyprland for git updates and shows a nice UI.
-
-- If updates are available (local branch is behind its upstream), the Update button
-  becomes blue and clickable.
-- If no updates are available, the Update button is disabled (grey).
-- You can refresh manually or wait for the periodic automatic refresh.
-
-Requirements:
-- Python 3
-- GTK3 and PyGObject (python3-gi, gir1.2-gtk-3.0)
-- git installed and available on PATH
-"""
 
 import logging
 import os
@@ -30,7 +17,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gio, GLib, Gtk
 
-from main_window import (
+from  import (
     APP_ID,
     APP_TITLE,
     REPO_PATH,
@@ -43,10 +30,8 @@ from main_window import (
 class App(Gtk.Application):
     def __init__(self) -> None:
         super().__init__(application_id=APP_ID)
-        # Ensure the process and app names map to the desktop file for icon association
         GLib.set_prgname("illogical-updots")
         GLib.set_application_name("Illogical Updots")
-        # Use theme icon name first
         try:
             LOG.debug("Setting default icon name 'illogical-updots'")
             Gtk.Window.set_default_icon_name("illogical-updots")
@@ -68,7 +53,7 @@ class App(Gtk.Application):
                 LOG.debug(f"Icon file not found: {p}")
             return False
 
-        # Known system and local paths
+        # some common locations to look for the app icon
         base_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
             "/usr/share/icons/hicolor/256x256/apps/illogical-updots.png",
@@ -111,9 +96,9 @@ class App(Gtk.Application):
 
     def do_activate(self) -> None:  # type: ignore[override]
         global REPO_PATH
-        # First-run selection if no repo path configured and no fallback found
+        # first run check: ensure the repository path is set
         if not REPO_PATH or not os.path.isdir(REPO_PATH):
-            # Explain the situation and ask user to continue to select a repository
+            # if not prompt user to select it
             alert = Gtk.MessageDialog(
                 transient_for=None,
                 flags=0,
@@ -131,7 +116,7 @@ class App(Gtk.Application):
             alert.destroy()
             if resp_alert != Gtk.ResponseType.OK:
                 return
-            # Open file chooser after user confirms
+            # open file picker
             chooser = Gtk.FileChooserDialog(
                 title="Select repository directory",
                 transient_for=None,
@@ -154,7 +139,7 @@ class App(Gtk.Application):
                     _save_settings(SETTINGS)
                     REPO_PATH = chosen
             chooser.destroy()
-            # If user canceled and we still don't have a valid path, do not open main window
+            # if canceled or invalid, just exit man
             if not REPO_PATH or not os.path.isdir(REPO_PATH):
                 return
 
@@ -162,29 +147,14 @@ class App(Gtk.Application):
             MainWindow(self)
         win = self.props.active_window
         if win:
-            # Help DEs map the window to the desktop file/icon
+            # some random ass thing that helps the icon to be displayed correctly
             try:
                 win.set_icon_name("illogical-updots")
-            except Exception:
-                pass
-            try:
-                # X11-specific; ignored elsewhere
-                win.set_wmclass("illogical-updots", "Illogical Updots")
             except Exception:
                 pass
             win.present()
 
     def do_shutdown(self) -> None:  # type: ignore[override]
-        # Stop sudo keepalive thread cleanly
-        win = self.props.active_window
-        if win and hasattr(win, "_sudo_keepalive_stop"):
-            try:
-                win._sudo_keepalive_stop.set()
-                t = getattr(win, "_sudo_keepalive_thread", None)
-                if t and t.is_alive():
-                    t.join(timeout=1.0)
-            except Exception:
-                pass
         Gtk.Application.do_shutdown(self)
 
 

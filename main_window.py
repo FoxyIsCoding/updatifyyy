@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
-"""
-GTK3 app that checks ~/dots-hyprland for git updates and shows a nice UI.
-
-- If updates are available (local branch is behind its upstream), the Update button
-  becomes blue and clickable.
-- If no updates are available, the Update button is disabled (grey).
-- You can refresh manually or wait for the periodic automatic refresh.
-
-Requirements:
-- Python 3
-- GTK3 and PyGObject (python3-gi, gir1.2-gtk-3.0)
-- git installed and available on PATH
-"""
 
 import os
 import shlex
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -27,14 +13,7 @@ import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import (
-    Gdk,  # noqa: E402  # type: ignore
-    GdkPixbuf,  # noqa: E402  # type: ignore
-    Gio,  # noqa: E402  # type: ignore
-    GLib,  # noqa: E402  # type: ignore
-    Gtk,  # noqa: E402  # type: ignore
-    Pango,  # noqa: E402  # type: ignore
-)
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango
 
 from dialogs.about import show_about_dialog
 from dialogs.changes import on_view_changes_quick
@@ -45,26 +24,45 @@ from helpers.ansi import insert_ansi_formatted
 from style.css import get_css
 from widgets.console import SetupConsole
 
+# -------------------------------------------------------------------
+# App metadata
+# -------------------------------------------------------------------
 APP_ID = "com.foxy.illogical-updots"
 APP_TITLE = "illogical-updots"
-# Settings (persisted)
+
+# -------------------------------------------------------------------
+# Settings file paths
+# -------------------------------------------------------------------
 SETTINGS_DIR = os.path.join(os.path.expanduser("~"), ".config", "illogical-updots")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 
 
+# -------------------------------------------------------------------
+# Load settings (with defaults)
+# -------------------------------------------------------------------
 def _load_settings() -> dict:
+    """
+    Load persisted settings from disk, applying defaults for missing keys.
+
+    Returns:
+        dict: Settings merged with defaults. Unknown keys in the file are ignored.
+
+    Error handling:
+        - Any exception while parsing or reading the file is swallowed
+          and defaults are returned (robust against file corruption).
+    """
     data = {
         "repo_path": "",
         "auto_refresh_seconds": 60,
-        "detached_console": False,  # run installer in separate window
-        "installer_mode": "auto",  # default changed to auto: can decide full vs files-only
-        "use_pty": True,  # PTY for embedded console
-        "force_color_env": True,  # force TERM/CLICOLOR env for color
-        "send_notifications": True,  # desktop notifications on finish
-        "log_max_lines": 5000,  # trim logs to this many lines (0 to disable)
-        "changes_lazy_load": True,  # lazy load commits with animations
-        "post_script_path": "",  # fish script to run after installer (no root)
-        "show_details_button": True,  # show 'Details…' button under banner
+        "detached_console": False,  # Use external console window instead of embedded
+        "installer_mode": "auto",  # auto / full / files-only
+        "use_pty": True,  # Preserve color & interactive prompts
+        "force_color_env": True,  # Force color env vars for spawned processes
+        "send_notifications": True,  # Desktop notifications on completion
+        "log_max_lines": 5000,  # Trim log buffer (0 = unlimited)
+        "changes_lazy_load": True,  # Lazy load commit list
+        "post_script_path": "",  # Optional script executed after install
+        "show_details_button": True,  # Show small details link under banner
     }
     try:
         if os.path.isfile(SETTINGS_FILE):
@@ -72,14 +70,28 @@ def _load_settings() -> dict:
 
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            # Only allow known keys
+            # Merge only known keys
             data.update({k: v for k, v in loaded.items() if k in data})
     except Exception:
         pass
     return data
 
 
+# -------------------------------------------------------------------
+# Save settings atomically
+# -------------------------------------------------------------------
 def _save_settings(data: dict) -> None:
+    """
+    Persist settings to disk atomically (write temp file then replace).
+
+    Args:
+        data: Dictionary of settings to persist.
+
+    Implementation details:
+        - Writes to a temporary file then replaces the target to avoid corruption
+          on partial writes.
+        - Silent on errors (non-critical).
+    """
     try:
         os.makedirs(SETTINGS_DIR, exist_ok=True)
         import json
@@ -95,13 +107,26 @@ def _save_settings(data: dict) -> None:
 SETTINGS = _load_settings()
 
 
+# -------------------------------------------------------------------
+# Detect initial repo path (fallback if missing)
+# -------------------------------------------------------------------
 def _detect_initial_repo_path() -> str:
+    """
+    Determine repository path to operate on.
+
+    Precedence:
+        1. Use stored 'repo_path' if it exists and is a directory.
+        2. Fall back to '~/.cache/dots-hyprland' if present (auto-detected).
+        3. Otherwise return empty string (signals UI error state).
+
+    Side effects:
+        - If fallback is used, update settings and persist immediately.
+    """
     p = str(SETTINGS.get("repo_path") or "").strip()
     if p and os.path.isdir(p):
         return p
     fallback = os.path.expanduser("~/.cache/dots-hyprland")
     if os.path.isdir(fallback):
-        # Persist fallback so future runs are consistent
         SETTINGS["repo_path"] = fallback
         _save_settings(SETTINGS)
         return fallback
@@ -112,8 +137,26 @@ REPO_PATH = _detect_initial_repo_path()
 AUTO_REFRESH_SECONDS = int(SETTINGS.get("auto_refresh_seconds", 60))
 
 
+# -------------------------------------------------------------------
+# Repo status structure
+# -------------------------------------------------------------------
 @dataclass
 class RepoStatus:
+    """
+    Snapshot of repository state used by UI logic.
+
+    Attributes:
+        ok (bool): Whether the repository is valid and accessible.
+        repo_path (str): Path to the repository.
+        branch (str|None): Current HEAD branch name.
+        upstream (str|None): Upstream tracking reference (e.g. origin/main).
+        behind (int): Number of commits local is behind upstream.
+        ahead (int): Number of commits local is ahead of upstream.
+        dirty (int): Count of modified/untracked files (`git status --porcelain`).
+        fetch_error (str|None): Any error message from `git fetch`.
+        error (str|None): Fatal error (invalid path / not a repo).
+    """
+
     ok: bool
     repo_path: str
     branch: Optional[str] = None
@@ -126,11 +169,32 @@ class RepoStatus:
 
     @property
     def has_updates(self) -> bool:
-        # We only consider "updates available" when behind > 0 (remote has new commits)
+        """
+        Returns:
+            bool: True if the repository is valid and there are upstream commits
+                  not yet pulled locally (behind > 0).
+        """
         return self.ok and self.behind > 0
 
 
+# -------------------------------------------------------------------
+# Git helpers
+# -------------------------------------------------------------------
 def run_git(args: list[str], cwd: str, timeout: int = 15) -> Tuple[int, str, str]:
+    """
+    Run a git command and capture stdout/stderr.
+
+    Args:
+        args: Arguments after 'git'.
+        cwd: Working directory (repository root).
+        timeout: Seconds before process is killed.
+
+    Returns:
+        (returncode, stdout, stderr)
+
+    Resilience:
+        - On any exception returns (1, "", str(exc)).
+    """
     try:
         cp = subprocess.run(
             ["git"] + args,
@@ -146,24 +210,45 @@ def run_git(args: list[str], cwd: str, timeout: int = 15) -> Tuple[int, str, str
 
 
 def get_branch(cwd: str) -> Optional[str]:
+    """
+    Get current branch name.
+
+    Returns:
+        str|None: Branch name or None if detached or error.
+    """
     rc, out, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
     return out.strip() if rc == 0 else None
 
 
 def get_upstream(cwd: str, branch: Optional[str]) -> Optional[str]:
-    # Try an explicit upstream ref; fall back to origin/<branch>
+    """
+    Determine upstream remote reference for current branch.
+
+    Strategy:
+        - Try rev-parse @{u} which resolves tracking reference.
+        - If that fails and branch is known, assume 'origin/<branch>'.
+
+    Returns:
+        str|None: Upstream or None if not found.
+    """
     rc, out, _ = run_git(
         ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd
     )
     if rc == 0:
         return out.strip()
     if branch:
-        # Fallback assumption
         return f"origin/{branch}"
     return None
 
 
 def get_dirty_count(cwd: str) -> int:
+    """
+    Count modified/untracked files.
+
+    Returns:
+        int: Number of non-empty lines in `git status --porcelain`.
+             Zero if error.
+    """
     rc, out, _ = run_git(["status", "--porcelain"], cwd)
     if rc != 0:
         return 0
@@ -171,11 +256,23 @@ def get_dirty_count(cwd: str) -> int:
 
 
 def check_repo_status(repo_path: str) -> RepoStatus:
+    """
+    Build a RepoStatus describing current repository update condition.
+
+    Workflow:
+        1. Validate path & presence of .git.
+        2. Run 'git fetch --all --prune' (non-fatal if fails).
+        3. Determine branch & upstream.
+        4. Compute behind/ahead counts via rev-list comparisons.
+        5. Count dirty files.
+
+    Returns:
+        RepoStatus: Complete snapshot (ok=False if invalid).
+    """
     if not os.path.isdir(repo_path):
         return RepoStatus(
             ok=False, repo_path=repo_path, error="Repository path not found"
         )
-
     if not os.path.isdir(os.path.join(repo_path, ".git")):
         return RepoStatus(ok=False, repo_path=repo_path, error="Not a git repository")
 
@@ -190,6 +287,7 @@ def check_repo_status(repo_path: str) -> RepoStatus:
     behind = 0
     ahead = 0
     if upstream:
+        # Count commits present in upstream but not local
         rc_b, out_b, _ = run_git(
             ["rev-list", "--count", f"HEAD..{upstream}"], repo_path
         )
@@ -198,6 +296,7 @@ def check_repo_status(repo_path: str) -> RepoStatus:
                 behind = int(out_b.strip() or "0")
             except ValueError:
                 behind = 0
+        # Count commits present locally but not upstream
         rc_a, out_a, _ = run_git(
             ["rev-list", "--count", f"{upstream}..HEAD"], repo_path
         )
@@ -221,13 +320,40 @@ def check_repo_status(repo_path: str) -> RepoStatus:
     )
 
 
+# -------------------------------------------------------------------
+# Main Window
+# -------------------------------------------------------------------
 class MainWindow(Gtk.ApplicationWindow):
+    """
+    Primary GTK Application window.
+
+    UI Components:
+        - Header bar: Refresh, Update, View changes, Menu (Settings / Logs / About).
+        - Status banner indicating update availability.
+        - Console area (revealer) for streaming installer output.
+        - Error message panel (revealer) for transient errors/warnings.
+
+    Lifecycle:
+        - On init: sets up UI, triggers first status refresh, schedules auto refresh.
+        - User actions: update triggers git pull and runs installer; refresh rescans repo.
+    """
+
     def __init__(self, app: Gtk.Application) -> None:
+        """
+        Initialize window controls and kick off first status check.
+
+        Args:
+            app: The Gtk.Application instance owning this window.
+
+        Implementation notes:
+            - Icon variants are searched across common system paths plus repo assets.
+            - All long-running tasks (git, installer) are performed in background threads.
+        """
         super().__init__(application=app, title=APP_TITLE)
         self.set_default_size(520, 280)
         self.set_border_width(0)
 
-        # Set icon by name (theme/desktop file) and build a multi-size icon list for WMs
+        # Try to load icons (theme + fallbacks)
         try:
             self.set_icon_name("illogical-updots")
         except Exception:
@@ -265,6 +391,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     if icon_list:
                         self.set_icon_list(icon_list)
                 except Exception:
+                    # Fallback single icon attempt
                     try:
                         self.set_icon_from_file(src)
                     except Exception:
@@ -272,7 +399,7 @@ class MainWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-        # HeaderBar
+        # Header bar
         hb = Gtk.HeaderBar()
         hb.set_show_close_button(True)
         hb.props.title = APP_TITLE
@@ -280,7 +407,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.header_bar.props.subtitle = REPO_PATH
         self.set_titlebar(hb)
 
-        # Refresh button on the left (start)
+        # Refresh button
         self.refresh_btn = Gtk.Button.new_from_icon_name(
             "view-refresh", Gtk.IconSize.BUTTON
         )
@@ -288,18 +415,18 @@ class MainWindow(Gtk.ApplicationWindow):
         self.refresh_btn.connect("clicked", self.on_refresh_clicked)
         hb.pack_start(self.refresh_btn)
 
-        # Update button on the right (end)
-        self.update_btn = Gtk.Button(label="Update")
-        # We'll toggle sensitivity and style dynamically
+        # Update button (changes label based on state)
+        self.update_btn = Gtk.Button(label="Update")  # triggers pull + installer
         self.update_btn.connect("clicked", self.on_update_clicked)
-        # View changes button (commits to pull)
+
+        # View changes button
         self.view_btn = Gtk.Button(label="View changes")
         self.view_btn.set_tooltip_text("View commits to be pulled")
         self.view_btn.connect(
             "clicked", lambda _btn: on_view_changes_quick(self, run_git)
         )
-        # Reordered pack_end so right side shows: Update, View changes, Menu (dots)
-        # Menu button (dropdown) with Settings and Logs
+
+        # Menu
         menu = Gtk.Menu()
         mi_settings = Gtk.MenuItem(label="Settings")
         mi_settings.connect("activate", self.on_settings_clicked)
@@ -312,7 +439,6 @@ class MainWindow(Gtk.ApplicationWindow):
         mi_about = Gtk.MenuItem(label="About")
         mi_about.connect("activate", self.on_about_clicked)
         menu.append(mi_about)
-
         menu.show_all()
 
         menu_btn = Gtk.MenuButton()
@@ -325,9 +451,8 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_end(menu_btn)
         hb.pack_end(self.view_btn)
         hb.pack_end(self.update_btn)
-        # Add Nerd Fonts install accessible also via menu item
 
-        # Main content
+        # Outer layout container
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add(outer)
 
@@ -335,7 +460,7 @@ class MainWindow(Gtk.ApplicationWindow):
         content.set_border_width(16)
         outer.pack_start(content, True, True, 0)
 
-        # Fullscreen primary banner (only main visible content)
+        # Banner: large primary label for status
         self.primary_label = Gtk.Label()
         self.primary_label.set_xalign(0.5)
         self.primary_label.set_yalign(0.5)
@@ -346,14 +471,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.primary_label.set_markup(
             "<span size='xx-large' weight='bold'>Checking repository status…</span>"
         )
-        # Make banner clickable to show detailed repo info
         self.primary_label.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
         self.primary_label.connect("button-press-event", self._on_banner_clicked)
+
         banner_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         banner_box.set_hexpand(True)
         banner_box.set_vexpand(True)
         banner_box.pack_start(self.primary_label, True, True, 0)
-        # Small info button under banner (hidden by default; shown when updates exist)
+
+        # Small details button (conditionally shown)
         self.small_info_btn = Gtk.Button(label="")
         self.small_info_btn.set_relief(Gtk.ReliefStyle.NONE)
         try:
@@ -364,25 +490,22 @@ class MainWindow(Gtk.ApplicationWindow):
         self.small_info_btn.connect("clicked", lambda _b: self._show_repo_info_dialog())
         self.small_info_btn.hide()
         banner_box.pack_start(self.small_info_btn, False, False, 0)
+
         content.pack_start(banner_box, True, True, 0)
 
-        # Remove secondary details label (minimal fullscreen banner)
+        # Details label intentionally omitted for minimal design
         self.details_label = None
 
-        # Spinner (for background work)
+        # Spinner + hint label row
         spin_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        spin_box.set_hexpand(False)
-        spin_box.set_vexpand(False)
         self.spinner = Gtk.Spinner()
         spin_box.pack_start(self.spinner, False, False, 0)
-
         self.status_hint = Gtk.Label(label="")
         self.status_hint.set_xalign(0.0)
         spin_box.pack_start(self.status_hint, False, False, 0)
-
         content.pack_start(spin_box, False, False, 0)
 
-        # Expandable autohiding embedded log console (revealer)
+        # Log console revealer (hidden until used)
         self.log_revealer = Gtk.Revealer()
         self.log_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         self.log_revealer.set_reveal_child(False)
@@ -393,7 +516,7 @@ class MainWindow(Gtk.ApplicationWindow):
         log_box.set_border_width(6)
         log_frame.add(log_box)
 
-        # Header with title and clear/hide controls
+        # Log header
         log_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         log_title = Gtk.Label(label="Console")
         log_title.set_xalign(0.0)
@@ -417,7 +540,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         log_box.pack_start(log_header, False, False, 0)
 
-        # TextView inside scrolled window
+        # Log view (TextView)
         self.log_view = Gtk.TextView()
         self.log_view.set_editable(False)
         self.log_view.set_cursor_visible(False)
@@ -431,28 +554,29 @@ class MainWindow(Gtk.ApplicationWindow):
         log_sw.add(self.log_view)
         log_box.pack_start(log_sw, True, True, 0)
 
-        # Interactive controls (entry + Y/N/Enter/Ctrl+C)
+        # Console input controls (for interactive installer prompts)
         self.log_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.log_input_entry = Gtk.Entry()
         self.log_input_entry.set_placeholder_text("Type input (Enter to send)")
         self.log_input_entry.connect("activate", self._on_log_send)
         self.log_controls.pack_start(self.log_input_entry, True, True, 0)
+
         for label, payload in [("Y", "y\n"), ("N", "n\n"), ("Enter", "\n")]:
             btn = Gtk.Button(label=label)
             btn.connect("clicked", lambda _b, t=payload: self._send_to_proc(t))
             self.log_controls.pack_start(btn, False, False, 0)
+
         ctrlc_btn = Gtk.Button(label="Ctrl+C")
         ctrlc_btn.connect("clicked", self._on_log_ctrl_c)
         self.log_controls.pack_start(ctrlc_btn, False, False, 0)
         log_box.pack_start(self.log_controls, False, False, 0)
 
-        # Key press mapping for quick Y/N/Enter when focus is in the log view
         self.log_view.connect("key-press-event", self._on_log_key_press)
 
         self.log_revealer.add(log_frame)
         outer.pack_start(self.log_revealer, False, False, 0)
 
-        # Error panel (kept)
+        # Error panel (collapsible)
         self.error_revealer = Gtk.Revealer()
         self.error_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
         self.error_revealer.set_reveal_child(False)
@@ -475,36 +599,41 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self.show_all()
         self.connect("key-press-event", self._on_key_press)
-        # Removed LogConsole usage; no key-press shortcut for install now.
 
-        # Initial state
+        # State tracking
         self._status: Optional[RepoStatus] = None
-        self._update_logs: list[
-            tuple[str, str, str]
-        ] = []  # (timestamp, event, details)
-
+        self._update_logs: list[tuple[str, str, str]] = []
         self._busy(False, "")
         self._current_proc = None
-        # Initialize sudo keepalive control objects
-        self._sudo_keepalive_stop = None
+        self._sudo_keepalive_stop = None  # (placeholder for future enhancement)
         self._sudo_keepalive_thread = None
 
-        # First refresh and periodic checks
+        # Initial and periodic refresh
         self.refresh_status()
         GLib.timeout_add_seconds(AUTO_REFRESH_SECONDS, self._auto_refresh)
 
-    # Wrapper methods to call module-level helpers for log panel
+    # Wrapper helpers delegating to shared functions (allow reuse)
     def _init_log_css(self) -> None:
+        """Apply CSS styles to the embedded console text view."""
         _init_log_css(self)
 
     def _append_log(self, text: str) -> None:
+        """Append text (with ANSI formatting) to the console buffer."""
         _append_log(self, text)
 
     def _clear_log_view(self) -> None:
+        """Clear the entire console log buffer."""
         _clear_log_view(self)
 
+    # Show message in error panel
     def _show_message(self, msg_type: Gtk.MessageType, message: str) -> None:
-        # Route messages to the top error panel instead of a bottom infobar
+        """
+        Display a transient message in the error panel.
+
+        Args:
+            msg_type: GTK message type (INFO / WARNING / ERROR).
+            message: Text to display; hides panel if empty.
+        """
         icon = (
             "dialog-error-symbolic"
             if msg_type in (Gtk.MessageType.ERROR, Gtk.MessageType.WARNING)
@@ -517,27 +646,46 @@ class MainWindow(Gtk.ApplicationWindow):
         self.error_label.set_text(message or "")
         self.error_revealer.set_reveal_child(bool(message))
 
+    # Add log entry to internal structured list (for history dialogs)
     def _add_log(self, event: str, summary: str, details: str) -> None:
+        """
+        Record an update-related event to internal log list.
+
+        Args:
+            event: Short event category.
+            summary: Human summary.
+            details: Extended multiline detail (optional).
+        """
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         self._update_logs.append(
             (ts, event, summary + ("\n" + details if details else ""))
         )
 
-    # Sudo / pkexec pre-auth and keepalive
+    # Disabled: no sudo keepalive / pre-auth (future extension placeholders)
     def _start_sudo_keepalive(self) -> None:
-        # Disabled: no background sudo keepalive
+        """Placeholder for future sudo keepalive logic (currently unused)."""
         return
 
     def _ensure_sudo_pre_auth(self) -> None:
-        # Disabled: no automatic sudo or polkit pre-auth
+        """Placeholder for pre-auth workflow (currently unused)."""
         return
 
     def _patch_setup_for_polkit(self, repo_path: str) -> None:
-        # Disabled: do not modify setup script for polkit/sudo
+        """Placeholder to patch setup script for polkit (currently unused)."""
         return
 
-    # Embedded log console helpers
+    # Send input to running process (pty or pipe)
     def _send_to_proc(self, text: str) -> None:
+        """
+        Send raw input text to the active installer process.
+
+        Supports:
+            - PTY master write (preferred when using PTY).
+            - Fallback: write to stdin file descriptor.
+
+        Args:
+            text: Input (include trailing newline if needed).
+        """
         p = getattr(self, "_current_proc", None)
         master_fd = getattr(p, "_pty_master_fd", None) if p else None
         if p and (master_fd is not None or getattr(p, "stdin", None)):
@@ -551,6 +699,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._append_log(f"[send error] {ex}\n")
 
     def _on_log_send(self, _entry: Gtk.Entry) -> None:
+        """Handle Enter key in input entry: send text to process and clear field."""
         entry = getattr(self, "log_input_entry", None)
         if not entry:
             return
@@ -562,6 +711,10 @@ class MainWindow(Gtk.ApplicationWindow):
         entry.set_text("")
 
     def _on_log_ctrl_c(self, _btn: Gtk.Button) -> None:
+        """
+        Send SIGINT to the current process (simulate Ctrl+C).
+        Useful for canceling interactive prompts.
+        """
         p = getattr(self, "_current_proc", None)
         if p:
             try:
@@ -573,7 +726,12 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._append_log(f"[ctrl-c error] {ex}\n")
 
     def _on_log_key_press(self, _widget, event) -> bool:
-        # Map Y/N/Enter when log view has focus
+        """
+        Key press handler when focus is in log view.
+
+        Quick shortcuts for y/n/newline to accelerate interactive prompts
+        without needing to focus the entry.
+        """
         if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
             self._send_to_proc("\n")
             return True
@@ -585,25 +743,26 @@ class MainWindow(Gtk.ApplicationWindow):
             return True
         return False
 
+    # Run installer commands either embedded or detached
     def _run_installer_common(
         self, test_mode: bool = False, commands: Optional[list[list[str]]] = None
     ) -> None:
         """
-        Run installer commands either embedded (default) or in a detached SetupConsole
-        window depending on SETTINGS['detached_console'].
+        Execute setup installer sequence in either:
+            - Detached external console (if settings enable).
+            - Embedded console with streamed output.
+
+        Args:
+            test_mode: If True, indicates dry-run style execution (affects banners).
+            commands: Explicit command sequences (each a list of argv).
         """
         repo_path = self._status.repo_path if self._status else REPO_PATH
         setup_path = os.path.join(repo_path, "setup")
         detached = bool(SETTINGS.get("detached_console", False))
-
-        # Decide command list
         cmds = commands or [["./setup", "install"]]
 
-        # Ensure sudo credential cache
-        # Removed automatic sudo/polkit pre-auth
-
         if detached:
-            # Detached console path
+            # Launch in external SetupConsole widget
             if not (os.path.isfile(setup_path) and os.access(setup_path, os.X_OK)):
                 self._show_message(
                     Gtk.MessageType.INFO, "No executable './setup' found."
@@ -625,7 +784,7 @@ class MainWindow(Gtk.ApplicationWindow):
             )
             return
 
-        # Embedded path (colored PTY streaming)
+        # Embedded flow
         lr = getattr(self, "log_revealer", None)
         if lr:
             lr.set_reveal_child(True)
@@ -637,6 +796,7 @@ class MainWindow(Gtk.ApplicationWindow):
         )
 
         def work():
+            """Background thread performing sequential installer commands."""
             success = False
             if os.path.isfile(setup_path) and os.access(setup_path, os.X_OK):
                 for cmd in cmds:
@@ -652,6 +812,7 @@ class MainWindow(Gtk.ApplicationWindow):
                         )
                         self._current_proc = p
                         if p and p.stdout:
+                            # Stream line-by-line (real-time)
                             for line in iter(p.stdout.readline, ""):
                                 if not line:
                                     break
@@ -664,6 +825,7 @@ class MainWindow(Gtk.ApplicationWindow):
                                 break
                             success = True
                         else:
+                            # Fallback path: run via fish if setup not exec-wrapped
                             fallback_cmd = ["fish"] + cmd
                             self._append_log(f"[fallback] {' '.join(fallback_cmd)}\n")
                             env = dict(os.environ)
@@ -710,6 +872,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._append_log("No executable './setup' found. Nothing to run.\n")
 
             def done():
+                """Finalize UI state after installer thread completes."""
                 self._busy(False, "")
                 title = "Installer (test mode)" if test_mode else "Installer"
                 status_msg = (
@@ -725,11 +888,15 @@ class MainWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=work, daemon=True).start()
 
+    # Best effort polkit keep auth (ignored errors)
     def _ensure_polkit_keep_auth(self) -> None:
         """
-        Install a polkit rules file to allow cached admin authentication (AUTH_ADMIN_KEEP)
-        for the current user (and wheel/sudo groups) so pkexec does not prompt repeatedly.
-        Best-effort; silently ignores failures.
+        Attempt to install a polkit rule that grants persistent admin keep auth
+        for the current user or wheel/sudo groups.
+
+        Non-fatal:
+            - Exceptions are swallowed; absence of polkit rule simply means
+              password prompts may reappear.
         """
         try:
             import shlex
@@ -744,7 +911,6 @@ polkit.addRule(function(action, subject) {{
     }}
 }});
 """
-            # Check if already present with same content
             need_write = True
             try:
                 with open(rule_path, "r", encoding="utf-8") as f:
@@ -758,7 +924,6 @@ polkit.addRule(function(action, subject) {{
                 need_write = True
             if not need_write:
                 return
-            # Write via pkexec if available, fallback to sudo
             cmd = f"cat > {shlex.quote(rule_path)} <<'EOF'\n{rule_content}\nEOF\nchmod 644 {shlex.quote(rule_path)}"
             if shutil.which("pkexec"):
                 subprocess.run(
@@ -777,10 +942,18 @@ polkit.addRule(function(action, subject) {{
         except Exception:
             pass
 
+    # Plan install commands based on mode
     def _plan_install_commands(self) -> list[list[str]]:
         """
-        Plan installer commands based on installer_mode.
-        In 'auto' we default to files-only here; possible full install handled earlier.
+        Determine which installer commands to run based on installer_mode.
+
+        Modes:
+            full        -> ['./setup', 'install']
+            auto        -> Begin with files-only unless user chooses full later.
+            files-only  -> ['./setup', 'install-files']
+
+        Returns:
+            list[list[str]]: A list of command argument vectors.
         """
         mode = str(SETTINGS.get("installer_mode", "auto"))
         if mode == "full":
@@ -788,24 +961,29 @@ polkit.addRule(function(action, subject) {{
             return [["./setup", "install"]]
         if mode == "auto":
             self._append_log("Installer mode: auto (pending decision).\n")
-            # Decision for full vs files-only is made in on_update_clicked
             return [["./setup", "install-files"]]
         self._append_log("Installer mode: files-only.\n")
         return [["./setup", "install-files"]]
 
+    # Check for merge/rebase/cherry-pick conflicts
     def _check_and_handle_unmerged_conflicts(self, repo_path: str) -> bool:
         """
-        Detect unresolved merge/rebase/cherry-pick conflicts before updating.
-        If detected, prompt the user to abort the in-progress operation(s).
-        Returns True if it is safe to continue with update, False to cancel.
+        Detect in-progress merge/rebase/cherry-pick operations or unmerged files.
+
+        If conflicts found:
+            - Presents user dialog summarizing where conflicts exist.
+            - Offers option to abort operations (merge/rebase/cherry-pick) and continue.
+            - Aborts update if user cancels or abort fails to clean state.
+
+        Returns:
+            bool: True if safe to proceed; False if canceled or unresolved.
         """
-        # Check for unmerged files
         rc_u, out_u, _ = run_git(["diff", "--name-only", "--diff-filter=U"], repo_path)
         unmerged_files = [
             ln for ln in (out_u.splitlines() if rc_u == 0 else []) if ln.strip()
         ]
 
-        # Detect in-progress operations
+        # Determine in-progress states via sentinel refs
         merge_in_progress = (
             subprocess.run(
                 ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
@@ -826,7 +1004,6 @@ polkit.addRule(function(action, subject) {{
             ).returncode
             == 0
         )
-        # Rebase markers
         rebase_in_progress = any(
             os.path.isdir(os.path.join(repo_path, ".git", d))
             for d in ("rebase-apply", "rebase-merge")
@@ -838,9 +1015,9 @@ polkit.addRule(function(action, subject) {{
             or rebase_in_progress
             or cherry_in_progress
         ):
-            return True  # safe to continue
+            return True
 
-        # Prompt user to abort or cancel
+        # Build dialog message
         msg = "Unresolved merge/rebase detected.\n\n"
         if unmerged_files:
             msg += f"Unmerged files: {len(unmerged_files)}\n"
@@ -867,7 +1044,7 @@ polkit.addRule(function(action, subject) {{
         if resp != Gtk.ResponseType.OK:
             return False
 
-        # Attempt abort(s)
+        # Attempt aborts
         ok = True
         if merge_in_progress:
             self._append_log("[git] merge --abort\n")
@@ -903,7 +1080,7 @@ polkit.addRule(function(action, subject) {{
                 ok = False
                 self._append_log(f"[git error] cherry-pick --abort: {r.stderr}\n")
 
-        # Re-check unmerged files after abort attempts
+        # Verify no unmerged remain
         rc_u2, out_u2, _ = run_git(
             ["diff", "--name-only", "--diff-filter=U"], repo_path
         )
@@ -919,10 +1096,14 @@ polkit.addRule(function(action, subject) {{
                 Gtk.MessageType.ERROR,
                 "Unmerged files remain after abort. Resolve conflicts manually before updating.",
             )
-
         return ok
 
+    # Tray icon support (minimal)
     def _ensure_tray_icon(self):
+        """
+        Lazily create a status tray icon (if supported) used for full install
+        when window hides (e.g. launching kitty). Exceptions are ignored.
+        """
         if getattr(self, "_tray_icon", None):
             return
         try:
@@ -934,6 +1115,7 @@ polkit.addRule(function(action, subject) {{
             pass
 
     def _restore_from_tray(self):
+        """Re-show window and hide tray icon after background operation completes."""
         try:
             self.show_all()
             if getattr(self, "_tray_icon", None):
@@ -941,13 +1123,17 @@ polkit.addRule(function(action, subject) {{
         except Exception:
             pass
 
+    # Decide full install in auto mode based on package-related changes
     def _auto_mode_decide_full(self, repo_path: str) -> bool:
         """
-        In 'auto' mode, detect INCOMING changes from upstream within sdata/dist-arch.
-        If such changes are detected, prompt for FULL installation in external terminal.
-        Returns True if user chooses full install, False for files-only.
+        In 'auto' mode attempt to detect if a FULL install is warranted:
+            - Look for changes affecting 'sdata' or 'dist-arch' between HEAD and upstream.
+            - If upstream unknown, fallback to checking local status for those paths.
+            - Prompt user to choose full vs files-only when such changes are found.
+
+        Returns:
+            bool: True if user selects full install, False otherwise.
         """
-        # Determine upstream ref
         upstream = None
         try:
             st = getattr(self, "_status", None)
@@ -957,12 +1143,10 @@ polkit.addRule(function(action, subject) {{
             )
         except Exception:
             upstream = None
-        # Fetch to ensure we compare against the latest upstream
         try:
             run_git(["fetch", "--all", "--prune"], repo_path)
         except Exception:
             pass
-        # Check for incoming changes in sdata/dist-arch from upstream
         changed = False
         if upstream:
             for rel in ["sdata", "dist-arch"]:
@@ -972,7 +1156,6 @@ polkit.addRule(function(action, subject) {{
                 if rc == 0 and any(line.strip() for line in out.splitlines()):
                     changed = True
                     break
-        # Fallback: if upstream unknown, check local modified/untracked as a best-effort
         if not changed and not upstream:
             for rel in ["sdata", "dist-arch"]:
                 rc, out, _ = run_git(["status", "--porcelain", "--", rel], repo_path)
@@ -981,6 +1164,7 @@ polkit.addRule(function(action, subject) {{
                     break
         if not changed:
             return False
+
         dlg = Gtk.MessageDialog(
             transient_for=self,
             flags=0,
@@ -989,7 +1173,7 @@ polkit.addRule(function(action, subject) {{
             text="Package-related changes detected",
         )
         dlg.format_secondary_text(
-            "Incoming changes found in sdata/dist-arch.\nRun FULL installation for package changes?\n\nYes = full (./setup --install)\nNo = minimal (./setup --install-files)"
+            "Incoming changes found in sdata/dist-arch.\nRun FULL installation?\n\nYes = full (./setup install)\nNo = minimal (./setup install-files)"
         )
         dlg.add_button("No (files-only)", Gtk.ResponseType.NO)
         dlg.add_button("Yes (full)", Gtk.ResponseType.YES)
@@ -997,12 +1181,13 @@ polkit.addRule(function(action, subject) {{
         dlg.destroy()
         return resp == Gtk.ResponseType.YES
 
+    # Trigger update flow without a pull (test shortcut)
     def _run_update_without_pull(self) -> None:
-        # Route to the same update flow as the Update button for consistency
+        """Convenience shortcut to start update workflow directly (Ctrl+I)."""
         self.on_update_clicked(None)
 
     def _on_key_press(self, _widget, event) -> bool:
-        # Ctrl+I triggers test update (no git pull)
+        """Global key handler: Ctrl+I to trigger internal update without pull prompt."""
         if event.state & Gdk.ModifierType.CONTROL_MASK and event.keyval in (
             Gdk.KEY_i,
             Gdk.KEY_I,
@@ -1012,17 +1197,26 @@ polkit.addRule(function(action, subject) {{
         return False
 
     def _auto_refresh(self) -> bool:
-        # Periodic refresh; return True to keep the timer
+        """Timer callback to refresh status. Always returns True to keep repeating."""
         self.refresh_status()
         return True
 
     def _busy(self, is_busy: bool, hint: str) -> None:
+        """
+        Set busy UI state:
+            - Disables refresh/update buttons.
+            - Shows spinner & hint text.
+            - Controls sensitivity based on presence of updates.
+
+        Args:
+            is_busy: Whether an operation is in progress.
+            hint: Short descriptive text for status row.
+        """
         self.refresh_btn.set_sensitive(not is_busy)
         can_update = (
             not is_busy and self._status is not None and self._status.has_updates
         )
         self.update_btn.set_sensitive(can_update)
-        # mirror availability for "View changes" button
         if hasattr(self, "view_btn"):
             self.view_btn.set_sensitive(can_update)
         if is_busy:
@@ -1030,15 +1224,18 @@ polkit.addRule(function(action, subject) {{
         else:
             self.spinner.stop()
         self.status_hint.set_text(hint or "")
-        # In minimal mode no log updates to disable
 
     def _apply_update_button_style(self) -> None:
-        # Always keep Update button clickable; change label/tooltip/style based on status
+        """
+        Adjust update button appearance:
+            - Adds 'suggested-action' style when updates available.
+            - Changes label/tooltip for up-to-date state.
+        """
         ctx = self.update_btn.get_style_context()
         self.update_btn.set_sensitive(True)
         if self._status and self._status.has_updates:
             if not ctx.has_class("suggested-action"):
-                ctx.add_class("suggested-action")  # typically blue in GTK themes
+                ctx.add_class("suggested-action")
             self.update_btn.set_label("Update")
             self.update_btn.set_tooltip_text("Pull latest updates from upstream")
         else:
@@ -1050,6 +1247,13 @@ polkit.addRule(function(action, subject) {{
             )
 
     def _set_labels_for_status(self, st: RepoStatus) -> None:
+        """
+        Set banner markup & optionally details based on RepoStatus.
+
+        Error handling:
+            - If repository invalid, show red banner.
+            - If fetch produced warning, show in error panel.
+        """
         if not st.ok:
             self.primary_label.set_markup(
                 "<span size='xx-large' weight='bold' foreground='red'>Repository error</span>"
@@ -1059,7 +1263,6 @@ polkit.addRule(function(action, subject) {{
             return
 
         if st.fetch_error:
-            # Non-fatal fetch warning: show in error panel without using _show_message
             try:
                 self.error_icon.set_from_icon_name(
                     "dialog-warning-symbolic", Gtk.IconSize.MENU
@@ -1069,8 +1272,6 @@ polkit.addRule(function(action, subject) {{
             self.error_label.set_text(f"Fetch warning: {st.fetch_error}")
             self.error_revealer.set_reveal_child(True)
 
-        # Primary line
-        # Reset banner state classes
         ctx = self.primary_label.get_style_context()
         ctx.remove_class("status-up")
         ctx.remove_class("status-ok")
@@ -1082,7 +1283,6 @@ polkit.addRule(function(action, subject) {{
                 f"<span size='xx-large' weight='bold'>Updates available</span>\n"
                 f"<span size='large'>{st.behind} new commit(s) to pull</span>"
             )
-            # Show small details link just below the banner
             if (
                 hasattr(self, "small_info_btn")
                 and self.small_info_btn
@@ -1093,15 +1293,12 @@ polkit.addRule(function(action, subject) {{
             elif hasattr(self, "small_info_btn") and self.small_info_btn:
                 self.small_info_btn.hide()
         else:
-            # ctx.add_class("status-ok")  # removed to avoid green styling
             self.primary_label.set_markup(
                 "<span size='xx-large' weight='bold'>Up to date</span>"
             )
-            # Hide small details link when up to date
             if hasattr(self, "small_info_btn") and self.small_info_btn:
                 self.small_info_btn.hide()
 
-        # Secondary details
         branch = st.branch or "(unknown)"
         upstream = st.upstream or "(no upstream)"
         changes = (
@@ -1123,22 +1320,33 @@ polkit.addRule(function(action, subject) {{
             self.details_label.set_text("\n".join(details))
 
     def refresh_status(self) -> None:
+        """
+        Start asynchronous refresh of repository status.
+
+        Spawns a thread to avoid blocking UI. On completion,
+        _finish_refresh is scheduled on main loop.
+        """
+
         def refresh_work():
             st = check_repo_status(REPO_PATH)
             GLib.idle_add(self._finish_refresh, st)
 
         if self._status is None:
-            # First load: show busy immediately
             self._busy(True, "Checking for updates...")
         else:
             self._busy(True, "Refreshing...")
         threading.Thread(target=refresh_work, daemon=True).start()
 
     def _finish_refresh(self, st: RepoStatus) -> None:
+        """
+        Apply refreshed status to UI (main loop).
+
+        Args:
+            st: Newly computed RepoStatus instance.
+        """
         self._status = st
         self._set_labels_for_status(st)
         self._apply_update_button_style()
-        # Update 'View changes' button based on status
         if hasattr(self, "view_btn"):
             can_view = bool(self._status and self._status.has_updates)
             self.view_btn.set_sensitive(can_view)
@@ -1148,7 +1356,11 @@ polkit.addRule(function(action, subject) {{
         self._busy(False, "")
 
     def _on_banner_clicked(self, _widget, _event) -> bool:
-        # If updates are available, open the changes dialog; otherwise show repo info
+        """
+        When banner clicked:
+            - If updates exist, open changes dialog.
+            - Otherwise show repository info.
+        """
         st = getattr(self, "_status", None)
         if st and st.has_updates:
             on_view_changes_quick(self, run_git)
@@ -1157,66 +1369,74 @@ polkit.addRule(function(action, subject) {{
         return True
 
     def _show_repo_info_dialog(self) -> None:
+        """Open dialog with repository details (branch/upstream/etc)."""
         show_repo_info_dialog(self, run_git)
 
     def on_refresh_clicked(self, _btn: Gtk.Button) -> None:
+        """Refresh button handler."""
         self.refresh_status()
 
     def on_logs_clicked(self, _btn: Gtk.Button) -> None:
+        """Open log history dialog."""
         self._show_logs_dialog()
 
     def on_settings_clicked(self, _btn: Gtk.Button) -> None:
+        """Open settings dialog for adjusting installer behavior & preferences."""
         self._show_settings_dialog()
 
     def on_about_clicked(self, _item) -> None:
+        """Show about dialog (credits/version)."""
         self._show_about_dialog()
 
     def _show_about_dialog(self) -> None:
+        """Internal wrapper for about dialog creation."""
         show_about_dialog(self, APP_TITLE, REPO_PATH, SETTINGS)
 
     def _show_logs_dialog(self) -> None:
+        """Internal wrapper to show aggregated update events."""
         show_logs_dialog(self)
 
     def _show_settings_dialog(self) -> None:
-        """
-        Clean single-page settings dialog with visual section headers using a ListBox.
-        Categories:
-          GENERAL
-          CONSOLE
-          VIEW
-          POST ACTIONS
-        """
+        """Internal wrapper for settings dialog invocation."""
         show_settings_dialog(
             self, SETTINGS, REPO_PATH, AUTO_REFRESH_SECONDS, _save_settings
         )
 
     def on_update_clicked(self, _btn: Gtk.Button) -> None:
-        # Allow update even when up to date (will run installer plan accordingly)
+        """
+        Update button handler:
+            - Ensures repo status.
+            - Decides full vs files-only for 'auto' mode (user prompt).
+            - Checks for unresolved conflicts and offers abort sequence.
+            - Performs git pull (rebase + autostash).
+            - Runs installer as needed.
+        """
         if not self._status:
-            # If status isn't ready yet, force a refresh then bail
             self.refresh_status()
             return
         repo_path = self._status.repo_path
 
-        # Auto mode decision before any git update (prompt now, use choice after pull)
         mode = str(SETTINGS.get("installer_mode", "auto"))
         if mode == "auto":
             full = self._auto_mode_decide_full(repo_path)
             self._auto_mode_choice = "full" if full else "files-only"
 
-        # Pre-check for unresolved conflicts/rebase in progress
         if not self._check_and_handle_unmerged_conflicts(repo_path):
-            # User canceled or abort failed; do not proceed
             self._append_log(
                 "[update] Aborted due to unresolved merge/rebase or user cancel.\n"
             )
             return
 
-        # Show embedded console and mark busy
         self._ensure_console_open()
         self._busy(True, "Updating...")
 
         def stream(cmd: list[str], cwd: str) -> int:
+            """
+            Helper to run a command and stream output lines to the log.
+
+            Returns:
+                int: Process exit code.
+            """
             self._append_log(f"$ {' '.join(cmd)}\n")
             try:
                 p = subprocess.Popen(
@@ -1242,6 +1462,7 @@ polkit.addRule(function(action, subject) {{
                 return 1
 
         def update_work():
+            """Background thread logic for pulling and installing."""
             stashed = False
             if self._status and self._status.dirty > 0:
                 self._append_log("Stashing local changes...\n")
@@ -1261,9 +1482,6 @@ polkit.addRule(function(action, subject) {{
                 )
                 stashed = True
 
-            # Pull with streaming already handled by stream() above for consistency if needed,
-            # but keep concise summary via subprocess.run to capture stdout/stderr for logs
-            # Decide installer plan based on pending commits before pulling
             plan_cmds = self._plan_install_commands()
             pull = subprocess.run(
                 ["git", "pull", "--rebase", "--autostash", "--stat"],
@@ -1283,17 +1501,16 @@ polkit.addRule(function(action, subject) {{
                     text=True,
                 )
 
-            # After pull, decide installer execution strategy (auto/full may use external kitty)
-            mode = str(SETTINGS.get("installer_mode", "auto"))
+            mode_local = str(SETTINGS.get("installer_mode", "auto"))
             full = False
-            if mode == "auto":
+            if mode_local == "auto":
                 full = getattr(self, "_auto_mode_choice", "files-only") == "full"
                 self._auto_mode_choice = None
-            elif mode == "full":
+            elif mode_local == "full":
                 full = True
-            if mode in ("auto", "full"):
+            if mode_local in ("auto", "full"):
                 if full:
-                    # Prefer external kitty for full install and hide to tray until done
+                    # If kitty exists, launch full install externally and minimize UI
                     if shutil.which("kitty") is not None:
 
                         def _prep_tray():
@@ -1327,10 +1544,7 @@ polkit.addRule(function(action, subject) {{
                                 msg = f"Failed to launch kitty: {ex}"
                                 GLib.idle_add(
                                     lambda: (
-                                        self._show_message(
-                                            Gtk.MessageType.ERROR,
-                                            msg,
-                                        ),
+                                        self._show_message(Gtk.MessageType.ERROR, msg),
                                         False,
                                     )
                                 )
@@ -1346,17 +1560,14 @@ polkit.addRule(function(action, subject) {{
                         threading.Thread(target=_kitty_work2, daemon=True).start()
                         return
                     else:
-                        # kitty missing; fall back to embedded full installer
                         plan_cmds = [["./setup", "install"]]
                 else:
-                    # Proceed with files-only install in embedded console
                     plan_cmds = [["./setup", "install-files"]]
-            # If installer exists, stream its output into the embedded log with PTY/colors
+
             setup_path = os.path.join(repo_path, "setup")
             if os.path.isfile(setup_path) and os.access(setup_path, os.X_OK):
                 self._append_log("Running installer...\n")
                 if "plan_cmds" not in locals() or not plan_cmds:
-                    # Fallback: ensure plan_cmds is defined (auto mode may have set it later)
                     plan_cmds = self._plan_install_commands()
                 extra_args = plan_cmds[0][1:]
                 try:
@@ -1368,7 +1579,6 @@ polkit.addRule(function(action, subject) {{
                         auto_input_seq=[],
                         use_pty=bool(SETTINGS.get("use_pty", True)),
                     )
-                    # Track current process so console input (Y/N/Enter) works
                     self._current_proc = p
                     out = getattr(p, "stdout", None)
                     if p and out is not None:
@@ -1379,8 +1589,8 @@ polkit.addRule(function(action, subject) {{
                         rc = p.wait()
                         self._append_log(f"[installer exit {rc}]\n")
                         self._current_proc = None
-                        # Fallback: if install-files failed, retry plain install
                         if rc != 0 and "install-files" in extra_args:
+                            # Fallback to full install if minimal fails
                             self._append_log("[fallback] Retrying with 'install'...\n")
                             p2 = _spawn_setup_install(
                                 repo_path,
@@ -1390,7 +1600,6 @@ polkit.addRule(function(action, subject) {{
                                 auto_input_seq=[],
                                 use_pty=bool(SETTINGS.get("use_pty", True)),
                             )
-                            # Track fallback installer as current process as well
                             self._current_proc = p2
                             out2 = getattr(p2, "stdout", None)
                             if p2 and out2 is not None:
@@ -1415,15 +1624,20 @@ polkit.addRule(function(action, subject) {{
         threading.Thread(target=update_work, daemon=True).start()
 
     def _finish_update(self, success: bool, stdout: str, stderr: str) -> None:
+        """
+        Finalize update workflow:
+            - Reset busy state.
+            - Hide console if open.
+            - Send desktop notification if enabled.
+            - Kick off post-install script if success.
+        """
         self._busy(False, "")
         title = "Update complete" if success else "Update failed"
         details = stdout + ("\n" + stderr if stderr else "")
         self._add_log(title, title, details)
-        # Auto-hide console after finishing
         if getattr(self, "log_revealer", None):
             self.log_revealer.set_reveal_child(False)
         self.refresh_status()
-        # Send notification about pull/update result
         if bool(SETTINGS.get("send_notifications", True)):
             try:
                 app = self.get_application()
@@ -1433,29 +1647,26 @@ polkit.addRule(function(action, subject) {{
                     app.send_notification("illogical-updots-update", notif)
             except Exception:
                 pass
-        # After installer completes, run configured post-install script (if any)
         if success:
             self._run_post_script_if_configured()
 
     def _run_post_script_if_configured(self) -> None:
         """
-        If a post-install script path is configured, run it via pkexec without prompting.
-        Streams output to the embedded console when available.
+        Execute optional post-install script defined in settings.
+
+        Behavior:
+            - If path missing or is a directory -> logs error.
+            - If executable -> runs directly; else runs through fish.
+            - Streams output into console, sends notification on completion.
         """
         path = str(SETTINGS.get("post_script_path") or "").strip()
         if not path:
             return
-
-        # Reveal console for visibility
         self._ensure_console_open()
-
         self._append_log("\n=== POST-INSTALL SCRIPT ===\n")
-
-        # Running unprivileged; no polkit needed
 
         def work():
             try:
-                # Build command: if script isn't executable, run it via bash interpreter
                 if not os.path.exists(path):
                     self._append_log(
                         f"[post-script error] path does not exist: {path}\n"
@@ -1490,7 +1701,6 @@ polkit.addRule(function(action, subject) {{
                     self._append_log(str(line))
                 rc = p.wait()
                 self._append_log(f"[post-script exit {rc}]\n")
-                # Notification for post script completion
                 if bool(SETTINGS.get("send_notifications", True)):
                     try:
                         app = self.get_application()
@@ -1510,32 +1720,28 @@ polkit.addRule(function(action, subject) {{
         threading.Thread(target=work, daemon=True).start()
 
     def _ensure_polkit_agent(self) -> None:
-        """
-        Removed: post-install runs unprivileged; no polkit agent handling needed.
-        """
+        """Placeholder: not needed (application runs unprivileged)."""
         return
-
-    # Removed key press handler (console/shortcut no longer used)
 
     def _ensure_console_open(self, desired_height: int = 320) -> None:
         """
-        Ensure the embedded console is visible.
+        Ensure console is visible and input controls are shown.
+
+        Args:
+            desired_height: Reserved for future dynamic sizing.
         """
         rev = getattr(self, "log_revealer", None)
         if not rev:
             return
         try:
             rev.set_reveal_child(True)
-            # Always show input controls when console visible
             if hasattr(self, "log_controls") and self.log_controls:
                 self.log_controls.show_all()
         except Exception:
             pass
 
     def toggle_console(self) -> None:
-        """
-        Toggle embedded console visibility.
-        """
+        """Toggle visibility of console revealer."""
         rev = getattr(self, "log_revealer", None)
         if not rev:
             return
@@ -1543,14 +1749,15 @@ polkit.addRule(function(action, subject) {{
 
     def run_install_external(self) -> None:
         """
-        Launch the setup installer in its own interactive log window (SetupConsole).
-        Provides live output and allows sending input (Y/N/Enter, password) directly.
+        Launch external SetupConsole running full install command:
+            ./setup install
+
+        Validates executable presence first.
         """
         setup_path = os.path.join(REPO_PATH, "setup")
         if not (os.path.isfile(setup_path) and os.access(setup_path, os.X_OK)):
             self._show_message(Gtk.MessageType.INFO, "No executable './setup' found.")
             return
-
         console = SetupConsole(self, title="Installer (setup install)")
         console.present()
         console.run_process(
@@ -1559,13 +1766,16 @@ polkit.addRule(function(action, subject) {{
             on_finished=self._run_post_script_if_configured,
         )
 
-    # Removed auto-respond logic (no embedded console interaction).
 
-
-# Helper functions for embedded log panel and commit avatars
-
-
+# -------------------------------------------------------------------
+# Shared helper functions (non-method versions for reuse)
+# -------------------------------------------------------------------
 def _init_log_css(self):
+    """
+    Apply application CSS to log view. Safe to call multiple times.
+
+    Adds 'log-view' style class to text view for targeted styling.
+    """
     css = get_css()
     try:
         provider = Gtk.CssProvider()
@@ -1583,8 +1793,13 @@ def _init_log_css(self):
 
 def _append_log(self, text: str):
     """
-    Thread-safe append to the embedded log view with ANSI color/style formatting.
-    Defensive against destroyed/unrealized widgets and iterator invalidation.
+    Append text to log buffer with ANSI formatting translation.
+
+    Implementation details:
+        - If widget unrealized, just inserts plain text (scrolling deferred).
+        - Maintains scroll at end when visible.
+        - Enforces optional line trim limit from settings.
+        - Thread-safe via GLib.idle_add when called off main thread.
     """
 
     def do_append():
@@ -1593,23 +1808,19 @@ def _append_log(self, text: str):
         buf = self.log_buf
         lv = self.log_view
         try:
-            # If view destroyed or unrealized, degrade to plain append without formatting
             if not lv.get_realized():
                 buf.insert(buf.get_end_iter(), text)
                 return False
-            # Use safe offset-based insertion; attempt ANSI formatting, fallback to plain
             buf.get_char_count()
             try:
                 insert_ansi_formatted(buf, text)
             except Exception:
                 buf.insert(buf.get_end_iter(), text)
             end_offset = buf.get_char_count()
-            # Scroll only if visible & realized
             if lv.get_visible() and lv.get_realized():
                 end_it = buf.get_iter_at_offset(end_offset)
                 mark = buf.create_mark(None, end_it, False)
                 lv.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
-            # Trim log lines if limit configured
             try:
                 limit = int(SETTINGS.get("log_max_lines", 0))
                 if limit and buf.get_line_count() > limit:
@@ -1619,25 +1830,22 @@ def _append_log(self, text: str):
             except Exception:
                 pass
         except Exception:
-            # Swallow any GTK/Pango issues
             pass
         return False
 
     try:
-        import threading
-
         if threading.current_thread() is threading.main_thread():
             do_append()
         else:
             GLib.idle_add(do_append)
     except Exception:
-        # Fallback: ignore
         pass
 
 
 def _clear_log_view(self):
     """
-    Thread-safe clear of the log buffer (retains ANSI tags definitions).
+    Clear console log buffer (thread-safe).
+    Uses idle_add if invoked off main thread.
     """
 
     def do_clear():
@@ -1649,8 +1857,6 @@ def _clear_log_view(self):
         return False
 
     try:
-        import threading
-
         if threading.current_thread() is threading.main_thread():
             do_clear()
         else:
@@ -1668,18 +1874,34 @@ def _spawn_setup_install(
     use_pty: bool = True,
 ):
     """
-    Spawn ./setup with ANSI color + interactive support.
+    Spawn the setup installer with progressive fallbacks and optional PTY.
 
-    If use_pty is True we allocate a pseudo-terminal so tools think they are in a real
-    terminal (preserves colors, interactive prompts). Falls back to direct execution
-    methods if PTY allocation fails.
+    Strategy:
+        1. Try './setup' directly.
+        2. Fallback to 'fish ./setup'.
+        3. Fallback to 'sh ./setup'.
 
-    Returns a Popen object or None. When PTY is used we monkey-patch p.stdout with a
-    text wrapper so existing readline loops continue to work.
+    PTY usage:
+        - When enabled, opens a pseudo terminal to preserve color + interactive prompts.
+        - Wraps PTY reads in a custom PTYStdout class delivering line-based reads.
+
+    Auto input:
+        - If auto_input_seq provided, sends specified items plus final 'yesforall'.
+        - Otherwise always sends 'yesforall'.
+
+    Args:
+        repo_path: Path to repo containing setup script.
+        logger: Callable accepting message lines.
+        extra_args: Additional arguments after './setup'.
+        capture_stdout: Whether to capture/stream stdout/stderr.
+        auto_input_seq: Optional sequence of string inputs to feed.
+        use_pty: Attempt PTY; fallback to pipe on failure.
+
+    Returns:
+        subprocess.Popen | None: Process object with p.stdout producing lines.
     """
     import errno
     import io
-    import os
     import pty
 
     extra_args = extra_args or []
@@ -1690,6 +1912,10 @@ def _spawn_setup_install(
     ]
 
     def _env():
+        """
+        Build environment ensuring color-friendly variables.
+        Terminates any 'NO_COLOR' to force colorized output.
+        """
         env = dict(os.environ)
         env.update(
             {
@@ -1723,24 +1949,27 @@ def _spawn_setup_install(
                     env=_env(),
                     close_fds=True,
                 )
-                # Close slave end in parent; child keeps it
                 try:
                     os.close(slave_fd)
                 except Exception:
                     pass
-                # Wrap master in text IO for readline compatibility (read-only)
                 master_file = os.fdopen(master_fd, "rb", buffering=0)
                 text_stream = io.TextIOWrapper(
                     master_file, encoding="utf-8", errors="replace", newline="\n"
                 )
 
                 class PTYStdout:
+                    """
+                    Simple line-buffered reader for PTY streams.
+
+                    Collects characters until newline encountered; returns lines preserving newline.
+                    """
+
                     def __init__(self, stream):
                         self._stream = stream
                         self._buffer = ""
 
                     def readline(self):
-                        # Accumulate until newline or EOF
                         while True:
                             chunk = self._stream.read(1)
                             if not chunk:
@@ -1759,7 +1988,6 @@ def _spawn_setup_install(
                 p._pty_master_fd = master_fd  # type: ignore[attr-defined]
                 logger(f"[spawn/pty] {' '.join(cmd)}\n")
             else:
-                # Non-PTY fallback
                 p = subprocess.Popen(
                     cmd,
                     cwd=repo_path,
@@ -1772,15 +2000,14 @@ def _spawn_setup_install(
                 )
                 logger(f"[spawn] {' '.join(cmd)}\n")
 
-            # Auto input sequence (sent after slight delay to allow prompt rendering)
             if auto_input_seq:
-
+                # Feed specified items then yesforall
                 def _feed():
                     import time as _t
 
-                    master_fd = getattr(p, "_pty_master_fd", None)
-                    pipe = p.stdin if master_fd is None else None
-                    if master_fd is None and not pipe:
+                    master_fd_local = getattr(p, "_pty_master_fd", None)
+                    pipe = p.stdin if master_fd_local is None else None
+                    if master_fd_local is None and not pipe:
                         logger(
                             "[auto-input] stdin unavailable; aborting auto sequence\n"
                         )
@@ -1788,13 +2015,12 @@ def _spawn_setup_install(
                     _t.sleep(0.2)
                     for item in auto_input_seq:
                         try:
-                            if master_fd is not None:
-                                os.write(master_fd, item.encode("utf-8", "replace"))
+                            if master_fd_local is not None:
+                                os.write(
+                                    master_fd_local, item.encode("utf-8", "replace")
+                                )
                             else:
-                                if pipe is None:
-                                    logger("[auto-input] stdin unavailable; stopping\n")
-                                    break
-                                if getattr(pipe, "closed", False):
+                                if pipe is None or getattr(pipe, "closed", False):
                                     logger("[auto-input] stdin closed; stopping\n")
                                     break
                                 os.write(pipe.fileno(), item.encode("utf-8", "replace"))
@@ -1803,11 +2029,12 @@ def _spawn_setup_install(
                             logger(f"[auto-input-error] {_ex}\n")
                             break
                         _t.sleep(0.25)
-                    # After auto-enters, append yesforall
                     try:
                         yesforall = "yesforall\n"
-                        if master_fd is not None:
-                            os.write(master_fd, yesforall.encode("utf-8", "replace"))
+                        if master_fd_local is not None:
+                            os.write(
+                                master_fd_local, yesforall.encode("utf-8", "replace")
+                            )
                         elif pipe:
                             os.write(
                                 pipe.fileno(), yesforall.encode("utf-8", "replace")
@@ -1818,18 +2045,17 @@ def _spawn_setup_install(
 
                 threading.Thread(target=_feed, daemon=True).start()
             else:
-                # Even without an explicit auto_input_seq, send a trailing 'yesforall'
+                # Always send baseline 'yesforall' to allow unattended flows
                 def _feed_yesforall():
-                    import os
                     import time as _t
 
                     _t.sleep(0.3)
-                    master_fd = getattr(p, "_pty_master_fd", None)
-                    pipe = p.stdin if master_fd is None else None
+                    master_fd_local = getattr(p, "_pty_master_fd", None)
+                    pipe = p.stdin if master_fd_local is None else None
                     try:
                         msg = "yesforall\n"
-                        if master_fd is not None:
-                            os.write(master_fd, msg.encode("utf-8", "replace"))
+                        if master_fd_local is not None:
+                            os.write(master_fd_local, msg.encode("utf-8", "replace"))
                         elif pipe:
                             os.write(pipe.fileno(), msg.encode("utf-8", "replace"))
                         logger(f"[auto-input] {repr(msg)}\n")
@@ -1840,7 +2066,7 @@ def _spawn_setup_install(
 
             return p
         except OSError as ex:
-            if ex.errno == errno.ENOEXEC:  # Exec format
+            if ex.errno == errno.ENOEXEC:
                 logger(
                     f"[warn] Exec format error with {' '.join(cmd)}; trying fallback...\n"
                 )
@@ -1855,7 +2081,15 @@ def _spawn_setup_install(
 
 
 def launch_install_external(repo_path: str) -> None:
-    # Try common terminal emulators
+    """
+    Launch full installer in an external terminal emulator.
+
+    Tries known terminals in order; first success returns immediately.
+    Falls back to running directly if none found.
+
+    Args:
+        repo_path: Path to repository containing setup script.
+    """
     terminals = [
         ("kitty", ["kitty", "-e"]),
         ("alacritty", ["alacritty", "-e"]),
@@ -1864,11 +2098,6 @@ def launch_install_external(repo_path: str) -> None:
         ("konsole", ["konsole", "-e"]),
         ("foot", ["foot", "sh", "-c"]),
     ]
-    # No script patching; rely on sudo -v keepalive
-    try:
-        pass
-    except Exception:
-        pass
     cmd = ["./setup", "install"]
     for name, base in terminals:
         if shutil.which(name):
@@ -1882,5 +2111,4 @@ def launch_install_external(repo_path: str) -> None:
                 return
             except Exception:
                 continue
-    # Fallback: run detached without terminal
     subprocess.Popen(cmd, cwd=repo_path)
