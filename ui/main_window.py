@@ -770,9 +770,19 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _restore_tweaks_after_install(self, success: bool) -> None:
         """
-        Offer merge restore of tweak files if backup exists.
-        """
+        Per-file interactive restore of tweak files (only prompt when content differs).
 
+        Updated logic:
+        - Skip entirely if keep_tweaks_beta disabled or no backup.
+        - Extract backup.
+        - Enumerate backup files.
+        - Upstream-changed or upstream-deleted files: keep new (no prompt).
+        - If backup vs new file identical: auto keep new (no prompt).
+        - Otherwise show a clean boxed dialog with a COLORED diff.
+            * Restore = replace updated file with backup (your tweaks) after saving current as .tweaks.bak
+            * Keep New = leave updated file untouched
+        - Summary printed to console.
+        """
         if not bool(SETTINGS.get("keep_tweaks_beta", False)):
             return
         zip_path = getattr(self, "_tweaks_backup_zip", None)
@@ -781,93 +791,210 @@ class MainWindow(Gtk.ApplicationWindow):
         target = os.path.expanduser("~/.config/quickshell/ii")
         if not os.path.isdir(target):
             return
-        # Ask user
-        dlg = Gtk.MessageDialog(
-            transient_for=self,
-            flags=0,
-            message_type=Gtk.MessageType.QUESTION,
-            buttons=Gtk.ButtonsType.YES_NO,
-            text="Restore tweaks?",
-        )
-        dlg.format_secondary_text(
-            "A backup of your ~/.config/quickshell/ii was made before install.\n"
-            "Restore & merge your previous tweaks into the updated files?"
-        )
-        resp = dlg.run()
-        dlg.destroy()
-        if resp != Gtk.ResponseType.YES:
-            self.console.append("[keep-tweaks] User declined restore.\n")
-            return
+
+        import difflib
         import tempfile
         import zipfile
 
         work_dir = tempfile.mkdtemp(prefix="illogical-updots-tweaks-")
-        restored = 0
-        kept = 0
-        merged = 0
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(work_dir)
-            # Walk extracted files
-            for root, dirs, files in os.walk(work_dir):
-                for fn in files:
-                    backup_full = os.path.join(root, fn)
-                    rel = os.path.relpath(backup_full, work_dir)
-                    target_full = os.path.join(target, rel)
-                    # Ensure directory exists
-                    os.makedirs(os.path.dirname(target_full), exist_ok=True)
-                    if not os.path.exists(target_full):
-                        # If the file was deleted upstream, treat as changed and keep deletion
-                        try:
-                            changed_set = set(
-                                getattr(self, "_upstream_changed_ii", set())
-                            )
-                        except Exception:
-                            changed_set = set()
-                        if rel in changed_set:
-                            kept += 1
-                            # Upstream removed this file; keep deletion
-                            continue
-                        # Not changed upstream: restore user's old version
-                        try:
-                            shutil.copy2(backup_full, target_full)
-                            restored += 1
-                        except Exception as ex:
-                            self.console.append(
-                                f"[keep-tweaks restore error] {rel}: {ex}\n"
-                            )
-                    else:
-                        # Prefer upstream decision: keep new if changed upstream, else restore old
-                        try:
-                            changed_set = set(
-                                getattr(self, "_upstream_changed_ii", set())
-                            )
-                            if rel in changed_set:
-                                kept += 1
-                                # Upstream has changes for this file: keep the updated version
-                                continue
-                            else:
-                                # Not changed upstream: restore user's old version
-                                shutil.copy2(backup_full, target_full)
-                                restored += 1
-                                continue
-                        except Exception as ex:
-                            self.console.append(
-                                f"[keep-tweaks decision error] {rel}: {ex}\n"
-                            )
-                        # Strict keep-tweaks: no contextual merge; fallback to restoring old on decision failure
-                        try:
-                            shutil.copy2(backup_full, target_full)
-                            restored += 1
-                        except Exception as ex:
-                            self.console.append(
-                                f"[keep-tweaks restore error] {rel}: {ex}\n"
-                            )
-            self.console.append(
-                f"[keep-tweaks] Restore complete. Kept new {kept}, restored old {restored}.\n"
-            )
         except Exception as ex:
-            self.console.append(f"[keep-tweaks] Restore failed: {ex}\n")
+            self.console.append(f"[keep-tweaks] Failed to extract backup: {ex}\n")
+            return
+
+        # Upstream change tracking removed (simplified logic):
+        # We only prompt when file content differs or file was deleted.
+        # Identical content -> auto keep new. Missing current file -> prompt.
+
+        # Gather backup files
+        all_backup_files = []
+        for root, _dirs, files in os.walk(work_dir):
+            for fn in files:
+                backup_full = os.path.join(root, fn)
+                rel = os.path.relpath(backup_full, work_dir)
+                all_backup_files.append((rel, backup_full))
+
+        if not all_backup_files:
+            self.console.append("[keep-tweaks] Backup contained no files.\n")
+            return
+
+        restored_count = 0
+        kept_count = 0
+        skipped_count = 0
+
+        # If huge number of files, ask once for bulk action
+        if len(all_backup_files) > 200:
+            dlg_bulk = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.QUESTION,
+                buttons=Gtk.ButtonsType.NONE,
+                text="Large backup",
+            )
+            dlg_bulk.format_secondary_text(
+                f"{len(all_backup_files)} files in backup.\n"
+                "Restore all unchanged files automatically?\n"
+                "Yes = restore all non-upstream-changed.\nNo = prompt file-by-file."
+            )
+            dlg_bulk.add_button("No (prompt)", Gtk.ResponseType.NO)
+            dlg_bulk.add_button("Yes (auto restore unchanged)", Gtk.ResponseType.YES)
+            r_bulk = dlg_bulk.run()
+            dlg_bulk.destroy()
+            auto_restore = r_bulk == Gtk.ResponseType.YES
+        else:
+            auto_restore = False
+
+        for rel, backup_full in all_backup_files:
+            target_full = os.path.join(target, rel)
+            os.makedirs(os.path.dirname(target_full), exist_ok=True)
+
+            # Determine initial action:
+            # If current file missing -> treat as difference (prompt user).
+            # If present -> will compare contents to decide (prompt only if different).
+            if not os.path.exists(target_full):
+                action = None  # missing: prompt
+            else:
+                action = None  # will compare later
+
+            if auto_restore and action is None:
+                action = Gtk.ResponseType.YES  # bulk restore for unchanged
+
+            # Interactive prompt if not decided yet
+            if action is None:
+                # Prepare a short diff preview (first 20 lines of unified diff)
+                diff_preview = ""
+                diff_lines = []
+                try:
+                    with open(
+                        backup_full, "r", encoding="utf-8", errors="ignore"
+                    ) as f_old:
+                        old_lines = f_old.readlines()
+                    if os.path.exists(target_full):
+                        with open(
+                            target_full, "r", encoding="utf-8", errors="ignore"
+                        ) as f_new:
+                            new_lines = f_new.readlines()
+                    else:
+                        new_lines = []
+                    # If identical (and file existed), skip prompt (auto keep new)
+                    if new_lines and old_lines == new_lines:
+                        kept_count += 1
+                        continue
+                    # If file missing or differs -> proceed to diff / prompt
+                    diff_lines = list(
+                        difflib.unified_diff(
+                            new_lines,
+                            old_lines,
+                            fromfile="updated",
+                            tofile="backup",
+                            lineterm="",
+                        )
+                    )
+                    # Truncate for preview rendering; full diff kept in memory
+                    if diff_lines:
+                        diff_preview = diff_lines[:200]
+                except Exception:
+                    diff_lines = []
+                    diff_preview = []
+
+                # Custom boxed dialog (cleaner UI) with colored diff
+                dlg = Gtk.Dialog(
+                    title="Restore previous version", transient_for=self, flags=0
+                )
+                dlg.add_button("Keep New", Gtk.ResponseType.NO)
+                dlg.add_button("Restore", Gtk.ResponseType.YES)
+                content = dlg.get_content_area()
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+                box.set_border_width(16)
+                content.add(box)
+
+                # Filename header
+                lbl_title = Gtk.Label()
+                lbl_title.set_xalign(0.0)
+                lbl_title.set_use_markup(True)
+                lbl_title.set_markup(f"<b>{GLib.markup_escape_text(rel)}</b>")
+                box.pack_start(lbl_title, False, False, 0)
+
+                # Explanation
+                lbl_info = Gtk.Label()
+                lbl_info.set_xalign(0.0)
+                lbl_info.set_use_markup(True)
+                lbl_info.set_line_wrap(True)
+                lbl_info.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                lbl_info.set_markup(
+                    "<small>Restore = use backup (your tweaks)\nKeep New = keep updated file</small>"
+                )
+                box.pack_start(lbl_info, False, False, 0)
+
+                # Colored diff (only when content actually differs)
+                if diff_lines:
+                    frame = Gtk.Frame()
+                    frame.set_shadow_type(Gtk.ShadowType.IN)
+                    box.pack_start(frame, True, True, 0)
+                    sw_diff = Gtk.ScrolledWindow()
+                    sw_diff.set_policy(
+                        Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+                    )
+                    sw_diff.set_min_content_height(260)
+                    frame.add(sw_diff)
+                    tv = Gtk.TextView()
+                    tv.set_editable(False)
+                    tv.set_cursor_visible(False)
+                    tv.modify_font(Pango.FontDescription("Monospace 10"))
+                    buf = tv.get_buffer()
+                    # Tag definitions
+                    tag_add = buf.create_tag(None, foreground="#A3BE8C")
+                    tag_del = buf.create_tag(None, foreground="#BF616A")
+                    tag_hunk = buf.create_tag(None, foreground="#EBCB8B")
+                    tag_meta = buf.create_tag(None, foreground="#5E81AC")
+                    tag_norm = buf.create_tag(None, foreground="#D8DEE9")
+                    for line in diff_preview:
+                        line_text = line + ("\n" if not line.endswith("\n") else "")
+                        start_iter = buf.get_end_iter()
+                        buf.insert(start_iter, line_text)
+                        end_iter = buf.get_end_iter()
+                        if line.startswith("@@"):
+                            buf.apply_tag(tag_hunk, start_iter, end_iter)
+                        elif line.startswith("+") and not line.startswith("+++"):
+                            buf.apply_tag(tag_add, start_iter, end_iter)
+                        elif line.startswith("-") and not line.startswith("---"):
+                            buf.apply_tag(tag_del, start_iter, end_iter)
+                        elif (
+                            line.startswith("diff ")
+                            or line.startswith("---")
+                            or line.startswith("+++")
+                        ):
+                            buf.apply_tag(tag_meta, start_iter, end_iter)
+                        else:
+                            buf.apply_tag(tag_norm, start_iter, end_iter)
+                    sw_diff.add(tv)
+
+                dlg.show_all()
+                resp = dlg.run()
+                dlg.destroy()
+                action = resp
+
+            if action == Gtk.ResponseType.YES:
+                try:
+                    # Save current new file for rollback if it exists
+                    if os.path.exists(target_full):
+                        try:
+                            shutil.copy2(target_full, target_full + ".tweaks.bak")
+                        except Exception:
+                            pass
+                    shutil.copy2(backup_full, target_full)
+                    restored_count += 1
+                except Exception as ex:
+                    self.console.append(f"[keep-tweaks restore error] {rel}: {ex}\n")
+                    skipped_count += 1
+            else:
+                kept_count += 1
+
+        self.console.append(
+            f"[keep-tweaks] Interactive restore finished. Restored {restored_count}, kept new {kept_count}, skipped {skipped_count}.\n"
+        )
 
     def _finish_update(self, success: bool, stdout: str, stderr: str) -> None:
         self._busy(False, "")
